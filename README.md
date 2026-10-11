@@ -18,7 +18,7 @@ Android, JNI, and FFmpeg stay in that project. Decode here is the host’s job
 
 ```bash
 sudo apt install build-essential libusb-1.0-0-dev ffmpeg
-git clone https://github.com/<you>/libampdac.git
+git clone https://github.com/petergross82/libampdac.git
 cd libampdac
 make
 ```
