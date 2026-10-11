@@ -1,0 +1,16 @@
+libampdac is a Linux userspace extract of the USB Audio Class 2 isochronous
+path from Audiophile Music Player.
+
+Upstream (MIT):
+  https://github.com/androidexpert35/Audiophile-Music-Player
+
+The files under native/ are that project's UAC2 engine (descriptor parser,
+clock control, ISO pool, DSD/DoP formatters, teardown). This repository does
+not include the Android app, JNI, FFmpeg decoder, or UI.
+
+Linux-specific work in this tree (ampdac C ABI, CLI, kernel unbind, Deadbeef
+output plugin, udev) is also MIT and lives beside those sources so the library
+can be built without the Android Gradle project.
+
+Deadbeef plugin headers under plugins/deadbeef/include/ are from DeaDBeeF
+1.10.3 (GPL-2.0) and are used only to compile the optional output plugin.
