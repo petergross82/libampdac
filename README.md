@@ -44,6 +44,7 @@ sudo install -m 755 build/ampdacd /usr/bin/ampdacd
 sudo install -m 755 build/libasound_module_pcm_ampdac.so \
     /usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/alsa-lib/
 sudo install -m 644 alsa/50-ampdac.conf /usr/share/alsa/alsa.conf.d/50-ampdac.conf
+sudo ln -sfn /usr/share/alsa/alsa.conf.d/50-ampdac.conf /etc/alsa/conf.d/50-ampdac.conf
 sudo install -m 644 systemd/ampdac.service systemd/ampdac.socket /etc/systemd/system/
 sudo install -m 644 wireplumber/50-ampdac.conf \
     /usr/share/wireplumber/wireplumber.conf.d/50-ampdac.conf
