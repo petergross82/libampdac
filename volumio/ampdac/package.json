@@ -1,0 +1,16 @@
+{
+  "name": "ampdac",
+  "version": "0.1.0",
+  "description": "Bit-perfect UAC2 output through ampdacd",
+  "main": "index.js",
+  "author": "petergross82",
+  "license": "MIT",
+  "volumio_info": {
+    "plugin_type": "miscellanea",
+    "boot_priority": 10,
+    "prettyName": "ampdac"
+  },
+  "engines": {
+    "node": ">=8"
+  }
+}

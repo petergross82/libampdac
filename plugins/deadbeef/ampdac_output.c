@@ -2,21 +2,21 @@
  * Deadbeef output plugin for libampdac (UAC2 exclusive ISO).
  *
  * Pull model (same as ALSA): a worker thread calls streamer_read() and
- * pushes bytes into ampdac_write(). One USB session lives across tracks
+ * pushes bytes into ampdacd (ampdac_client_write). One USB session lives across tracks
  * that share rate/channels/packing — that is gapless. Format change
  * closes and reopens the session (PLL retune).
  *
  * DSD: FFmpeg in Deadbeef turns DSF/DFF into float PCM unless DoP is on
  * (that was 1411200 Hz float — not a USB PCM rate). This plugin forces
  * ffmpeg.enable_dop so the streamer delivers 32-bit DoP. We unwrap the
- * markers and call ampdac_configure_dsd (AUTO: native RAW if the DAC has
+ * markers and call ampdac_client_configure_dsd (AUTO: native RAW if the DAC has
  * it, else DoP on TYPE_I).
  *
  * Build: make -C linux plugin
  */
 
 #include <deadbeef/deadbeef.h>
-#include "ampdac.h"
+#include "ampdac_ipc.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -40,7 +40,7 @@ static ddb_playback_state_t g_state = DDB_PLAYBACK_STATE_STOPPED;
 static int g_setformat_requested;
 static ddb_waveformat_t g_requested_fmt;
 
-static ampdac_session *g_session;
+static ampdac_client *g_session;
 static int g_unwrap_dop;
 static uint8_t g_dop_carry[8];
 static int g_dop_carry_n;
@@ -61,7 +61,7 @@ static int is_ffmpeg_dsd_pcm_rate(int hz) {
 
 static void close_session(void) {
     if (g_session) {
-        ampdac_close(g_session);
+        ampdac_client_disconnect(g_session);
         g_session = NULL;
     }
     g_unwrap_dop = 0;
@@ -73,9 +73,15 @@ static uint32_t dsd_rate_from_dop_clock(int dop_hz) {
     return (uint32_t)dop_hz * 16U;
 }
 
+static const char *session_socket(char *buf, size_t buflen) {
+    deadbeef->conf_get_str("ampdac.socket", "", buf, (int)buflen);
+    return buf[0] ? buf : NULL;
+}
+
 static int open_session(const ddb_waveformat_t *fmt) {
     uint16_t vid = (uint16_t)deadbeef->conf_get_int("ampdac.vid", 0);
     uint16_t pid = (uint16_t)deadbeef->conf_get_int("ampdac.pid", 0);
+    char socket_path[256];
 
     ddb_waveformat_t negotiated = *fmt;
     if (negotiated.channels <= 0) negotiated.channels = 2;
@@ -98,9 +104,9 @@ static int open_session(const ddb_waveformat_t *fmt) {
         return -1;
     }
 
-    ampdac_session *s = ampdac_open(vid, pid);
+    ampdac_client *s = ampdac_client_connect(session_socket(socket_path, sizeof(socket_path)));
     if (!s) {
-        TRACE("ampdac_open failed: %s\n", ampdac_last_error());
+        TRACE("ampdacd connect failed: %s\n", ampdac_client_last_error());
         return -1;
     }
 
@@ -115,18 +121,18 @@ static int open_session(const ddb_waveformat_t *fmt) {
         dsd.transport = AMPDAC_DSD_AUTO;
         negotiated.bps = 32;
         negotiated.is_float = 0;
-        st = ampdac_configure_dsd(s, &dsd);
+        st = ampdac_client_configure_dsd(s, vid, pid, &dsd);
         unwrap = 1;
         if (st != AMPDAC_OK) {
             TRACE("configure_dsd failed (%s); falling back to DoP PCM wire\n",
-                  ampdac_last_error());
+                  ampdac_client_last_error());
             ampdac_pcm_config cfg;
             memset(&cfg, 0, sizeof(cfg));
             cfg.sample_rate_hz = (uint32_t)negotiated.samplerate;
             cfg.channels = (uint8_t)negotiated.channels;
             cfg.format = AMPDAC_PCM_S32LE;
             cfg.volume = 1.0f;
-            st = ampdac_configure_pcm(s, &cfg);
+            st = ampdac_client_configure_pcm(s, vid, pid, &cfg);
             unwrap = 0;
         }
     } else {
@@ -147,21 +153,21 @@ static int open_session(const ddb_waveformat_t *fmt) {
             negotiated.bps = 32;
             negotiated.is_float = 0;
         }
-        st = ampdac_configure_pcm(s, &cfg);
+        st = ampdac_client_configure_pcm(s, vid, pid, &cfg);
     }
 
     if (st != AMPDAC_OK) {
         TRACE("ampdac_configure failed: %s (%s)\n",
-              ampdac_status_string(st), ampdac_last_error());
-        ampdac_close(s);
+              ampdac_ipc_status_string(st), ampdac_client_last_error());
+        ampdac_client_disconnect(s);
         return -1;
     }
 
-    st = ampdac_start(s);
+    st = ampdac_client_start(s);
     if (st != AMPDAC_OK) {
         TRACE("ampdac_start failed: %s (%s)\n",
-              ampdac_status_string(st), ampdac_last_error());
-        ampdac_close(s);
+              ampdac_ipc_status_string(st), ampdac_client_last_error());
+        ampdac_client_disconnect(s);
         return -1;
     }
 
@@ -172,7 +178,7 @@ static int open_session(const ddb_waveformat_t *fmt) {
     if (unwrap) {
         ampdac_negotiated neg;
         memset(&neg, 0, sizeof(neg));
-        (void)ampdac_negotiated_format(s, &neg);
+        (void)ampdac_client_negotiated_format(s, &neg);
         TRACE("USB DSD %s from DoP unwrap, streamer %d Hz, USB clock %u Hz\n",
               neg.dsd_native ? "native" : "DoP",
               negotiated.samplerate, neg.sample_rate_hz);
@@ -214,11 +220,11 @@ static int apply_format(void) {
 static int push_dsd_bytes(const uint8_t *p, int nbytes) {
     int off = 0;
     while (off < nbytes) {
-        const int n = ampdac_write(g_session, p + off, (size_t)(nbytes - off));
+        const int n = ampdac_client_write(g_session, p + off, (size_t)(nbytes - off));
         if (n < 0) {
             TRACE("ampdac_write: %s (%s)\n",
-                  ampdac_status_string((ampdac_status)n),
-                  ampdac_last_error());
+                  ampdac_ipc_status_string((ampdac_status)n),
+                  ampdac_client_last_error());
             return -1;
         }
         if (n == 0) break;
@@ -425,7 +431,9 @@ static void ampdac_out_enum_soundcards(
         void *userdata) {
     if (!callback) return;
     ampdac_device_info devices[16];
-    const int n = ampdac_list_devices(devices, 16);
+    char socket_path[256];
+    const int n = ampdac_client_list_devices(
+            session_socket(socket_path, sizeof(socket_path)), devices, 16);
     if (n <= 0) return;
     for (int i = 0; i < n; ++i) {
         char name[32];
@@ -460,7 +468,8 @@ static int ampdac_plugin_stop(void) {
 static const char settings_dlg[] =
         "property \"USB vendor id (0 = first UAC2 DAC)\" entry ampdac.vid 0;\n"
         "property \"USB product id (0 = first UAC2 DAC)\" entry ampdac.pid 0;\n"
-        "property \"Force FFmpeg DoP for DSD (no dsd2pcm)\" checkbox ampdac.force_ffmpeg_dop 1;\n";
+        "property \"Force FFmpeg DoP for DSD (no dsd2pcm)\" checkbox ampdac.force_ffmpeg_dop 1;\n"
+        "property \"ampdacd socket (empty = /run/ampdac.sock)\" entry ampdac.socket \"\";\n";
 
 static DB_output_t plugin = {
         DDB_PLUGIN_SET_API_VERSION
@@ -469,13 +478,13 @@ static DB_output_t plugin = {
         .plugin.type = DB_PLUGIN_OUTPUT,
         .plugin.flags = DDB_PLUGIN_FLAG_LOGGING | DDB_PLUGIN_FLAG_REPLAYGAIN,
         .plugin.id = "ampdac",
-        .plugin.name = "ampdac USB DAC (libusb UAC2)",
+        .plugin.name = "ampdac USB DAC (ampdacd)",
         .plugin.descr =
-                "Bit-perfect exclusive UAC2 output via libampdac.\n"
+                "Bit-perfect exclusive UAC2 output via the ampdacd daemon.\n"
                 "Keeps one ISO session across same-format tracks (gapless).\n"
                 "DSF/DFF: forces FFmpeg DoP, unwraps markers, native DSD if the\n"
                 "DAC has a RAW alt else DoP on PCM. Disable DSP for bit-perfect.\n"
-                "Requires write access to /dev/bus/usb (linux/grant-usb-dac.sh).\n",
+                "Start ampdacd first (systemctl enable --now ampdac.socket).\n",
         .plugin.copyright =
                 "MIT — derived from Audiophile Music Player USB path.\n",
         .plugin.website = "https://github.com/androidexpert35/Audiophile-Music-Player",

@@ -214,7 +214,20 @@ void IsoTransferPool::accept_feedback_bytes(const uint8_t *data, int length) noe
             q1616 = shifted;
         }
     }
-    if (q1616 == 0U) return;
+    if (q1616 == 0U) {
+        // Feedback IN completes every bInterval. Log the first rejects and
+        // any change of the raw word, not every packet.
+        static std::atomic<uint32_t> reject_count{0};
+        static std::atomic<uint32_t> last_raw{0xFFFFFFFFU};
+        const uint32_t n = reject_count.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t prev = last_raw.exchange(raw, std::memory_order_relaxed);
+        if (n < 4U || prev != raw) {
+            PLOGW("accept_feedback_bytes: rejected raw=0x%08X "
+                  "(nominal=0x%08X lo=0x%08X hi=0x%08X)",
+                  raw, nominal, lo, hi);
+        }
+        return;
+    }
     const uint32_t previous = feedback_q16_16_.exchange(q1616, std::memory_order_relaxed);
     if (previous == 0U) {
         const double frames = static_cast<double>(q1616) / 65536.0;

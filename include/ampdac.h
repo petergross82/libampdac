@@ -202,8 +202,11 @@ ampdac_status ampdac_get_stats(const ampdac_session *session,
  * Push interleaved samples for the configured session.
  * PCM: host decoder bytes in the format given to ampdac_configure_pcm.
  * DSD: interleaved MSBF DSD bytes (FFmpeg dsd_msbf / u8), no volume.
- * Blocks up to ~2 s on a full ring. ISO transfers start after the ring
- * is half full.
+ * Blocks while the ring is full (500 µs poll), up to ~2 s since the last
+ * successful push. A full ring does not return a short count: the call waits,
+ * then returns AMPDAC_ERR_TIMEOUT. ISO transfers start after the ring is half
+ * full. A trailing partial sample that does not fill a frame is left
+ * unconsumed and the return value is that shorter count.
  * @return bytes consumed from input, or a negative ampdac_status.
  */
 int ampdac_write(ampdac_session *session, const void *pcm, size_t bytes);

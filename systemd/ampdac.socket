@@ -1,0 +1,12 @@
+[Unit]
+Description=ampdac UAC2 transport socket
+
+[Socket]
+ListenStream=/run/ampdac.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=audio
+Accept=no
+
+[Install]
+WantedBy=sockets.target

@@ -62,6 +62,19 @@ add_executable(ampdac-cli examples/ampdac_cli.cpp)
 target_link_libraries(ampdac-cli PRIVATE ampdac)
 target_include_directories(ampdac-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+add_library(ampdac_client SHARED src/ampdac_client.c)
+target_include_directories(ampdac_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(ampdac_client PRIVATE _GNU_SOURCE)
+target_compile_options(ampdac_client PRIVATE -Wall -Wextra)
+
+add_executable(ampdacd src/ampdacd.cpp)
+target_link_libraries(ampdacd PRIVATE ampdac pthread)
+target_include_directories(ampdacd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(ipc_smoke tests/ipc_smoke.c)
+target_link_libraries(ipc_smoke PRIVATE ampdac_client)
+target_include_directories(ipc_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 add_library(ddb_out_ampdac MODULE plugins/deadbeef/ampdac_output.c)
 set_target_properties(ddb_out_ampdac PROPERTIES
     PREFIX ""
@@ -72,10 +85,32 @@ target_include_directories(ddb_out_ampdac PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/plugins/deadbeef/include
 )
 target_compile_definitions(ddb_out_ampdac PRIVATE _GNU_SOURCE)
-target_link_libraries(ddb_out_ampdac PRIVATE ampdac))
+target_link_libraries(ddb_out_ampdac PRIVATE ampdac_client)
 
-install(TARGETS ampdac ampdac-cli
+if(PkgConfig_FOUND)
+    pkg_check_modules(ALSA alsa)
+endif()
+if(ALSA_FOUND)
+    add_library(asound_module_pcm_ampdac MODULE alsa/pcm_ampdac.c)
+    set_target_properties(asound_module_pcm_ampdac PROPERTIES
+        PREFIX "lib"
+        OUTPUT_NAME "asound_module_pcm_ampdac"
+    )
+    target_include_directories(asound_module_pcm_ampdac PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${ALSA_INCLUDE_DIRS}
+    )
+    target_compile_definitions(asound_module_pcm_ampdac PRIVATE _GNU_SOURCE PIC)
+    target_link_libraries(asound_module_pcm_ampdac PRIVATE ampdac_client ${ALSA_LIBRARIES})
+    install(TARGETS asound_module_pcm_ampdac
+            LIBRARY DESTINATION ${ALSA_LIBDIR}/alsa-lib)
+endif()
+
+install(TARGETS ampdac ampdac_client ampdac-cli ampdacd
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin)
-install(FILES include/ampdac.h DESTINATION include)
+install(FILES include/ampdac.h include/ampdac_ipc.h DESTINATION include)
 install(FILES udev/99-ampdac.rules DESTINATION lib/udev/rules.d)
+install(FILES alsa/50-ampdac.conf DESTINATION share/alsa/alsa.conf.d)
+install(FILES systemd/ampdac.service systemd/ampdac.socket DESTINATION lib/systemd/system)
+install(FILES wireplumber/50-ampdac.conf DESTINATION share/wireplumber/wireplumber.conf.d)

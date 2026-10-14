@@ -1,0 +1,13 @@
+{
+  "page": { "label": "ampdac" },
+  "sections": [
+    {
+      "id": "about",
+      "element": "section",
+      "label": "UAC2 userspace output",
+      "description": "MPD plays to the ALSA device ampdac. Resampling stays off. Volume on this path is unity; use the DAC control. The daemon is ampdacd.",
+      "icon": "fa fa-volume-up",
+      "content": []
+    }
+  ]
+}
