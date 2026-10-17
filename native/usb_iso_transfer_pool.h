@@ -127,6 +127,8 @@ struct IsoTransferPoolConfig {
     uint8_t  feedback_endpoint_address = 0;
     uint8_t  feedback_interval         = 4;    ///< bInterval of the feedback EP
     uint8_t  sync_type                 = 0;    ///< UAC_ISO_SYNC_* of the OUT EP
+    /// Endpoint payload cap per microframe (wMaxPacketSize). 0 = unknown.
+    uint32_t max_packet_bytes          = 0;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -517,6 +519,7 @@ public:
      *          transfers are NOT cancelled — the caller must invoke
      *          `teardown_context()` to drain and cancel all slots cleanly.
      */
+    void prime_out_buffers() noexcept;
     int submit_all_transfers() noexcept;
 
     /**
@@ -674,6 +677,60 @@ public:
     /** Fill [dst, dst+n) with the current idle byte or tiled DoP pattern. */
     void fill_idle(uint8_t *dst, std::size_t n) noexcept;
 
+    /**
+     * Pad [buf+have, buf+need) with silence. DoP padding continues the marker
+     * of the bytes already in [buf, buf+have), so an underrun does not kick
+     * the DAC out of DSD.
+     */
+    void fill_gap(uint8_t *buf, std::size_t have, std::size_t need) noexcept;
+
+    /** Marker byte of the last DoP frame this pool put on the wire, or 0. */
+    [[nodiscard]] uint8_t last_dop_marker() const noexcept {
+        return last_dop_marker_.load(std::memory_order_relaxed);
+    }
+
+    /** Remember the marker of the last complete DoP frame in [buf, buf+n). */
+    void remember_dop_marker(const uint8_t *buf, std::size_t n) noexcept;
+
+    /**
+     * Rewrite DoP marker bytes so this buffer continues the marker last
+     * submitted. One sequence for audio and for silence.
+     */
+    void restamp_dop(uint8_t *buf, std::size_t n) noexcept;
+
+    /** Remember the last PCM stereo frame in a buffer just queued for the DAC. */
+    void note_pcm_tail(const uint8_t *buf, std::size_t n) noexcept;
+
+    /**
+     * Ask the callback to ramp the last PCM sample down to zero over
+     * [frames] instead of stepping to digital silence.
+     */
+    void request_pcm_fade(int frames) noexcept;
+
+    /**
+     * If a fade is pending or in progress, write it into [dst, dst+n) and
+     * return true. The caller must not pop the ring in that case.
+     */
+    bool render_pcm_fade(uint8_t *dst, std::size_t n) noexcept;
+
+    /** PCM payload whose marker bytes are DoP (DeaDBeeF ffmpeg DoP). */
+    [[nodiscard]] bool stream_is_dop() const noexcept {
+        return stream_is_dop_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool idle_is_dop() const noexcept {
+        return silence_pattern_len_ > 1U ||
+               stream_is_dop_.load(std::memory_order_relaxed);
+    }
+
+    /** Latch DoP if [buf, buf+n) is four stereo frames with alternating markers. */
+    void observe_dop_pcm(const uint8_t *buf, std::size_t n) noexcept;
+
+    /** Producer already saw DoP markers. Silence and fade must not clear them. */
+    void mark_stream_dop() noexcept {
+        stream_is_dop_.store(true, std::memory_order_release);
+    }
+
     /** Byte currently written for idle/underrun padding. */
     [[nodiscard]] uint8_t silence_byte() const noexcept {
         return silence_byte_.load(std::memory_order_relaxed);
@@ -758,6 +815,12 @@ private:
     /// only on the libusb event thread (same as fractional_accumulator_).
     uint32_t                           feedback_phase_ = 0;
 
+    /// Shift that brings this DAC's feedback word into Q16.16 samples/µframe.
+    /// Learned from the first in-range word, same rule as snd-usb-audio.
+    /// Touched only on the feedback callback thread.
+    bool                               feedback_shift_valid_ = false;
+    int                                feedback_shift_ = 0;
+
     /// libusb_transfer* ring — one entry per pool slot.
     std::vector<libusb_transfer *>     transfers_;
 
@@ -814,6 +877,17 @@ private:
     uint8_t silence_pattern_[kMaxSilencePatternBytes]{kPcmSilenceByte};
     uint8_t silence_pattern_len_{1};
     std::size_t silence_phase_{0};
+    /// Last DoP marker byte actually copied into an OUT payload. 0 until then.
+    std::atomic<uint8_t> last_dop_marker_{0};
+    /// Set when a PCM-classified stream is actually DoP. Never cleared.
+    std::atomic<bool> stream_is_dop_{false};
+    std::atomic<int32_t> last_pcm_l_{0};
+    std::atomic<int32_t> last_pcm_r_{0};
+    int32_t fade_origin_l_ = 0;
+    int32_t fade_origin_r_ = 0;
+    int fade_total_ = 0;
+    std::atomic<int> fade_request_{0};
+    std::atomic<int> fade_left_{0};
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

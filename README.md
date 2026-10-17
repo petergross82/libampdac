@@ -41,6 +41,7 @@ Players talk to `/run/ampdac.sock`, which is group `audio`.
 ```bash
 sudo install -m 755 build/libampdac.so /usr/lib/libampdac.so
 sudo install -m 755 build/ampdacd /usr/bin/ampdacd
+sudo install -m 755 volumio/ampdac/ampdac /usr/bin/ampdac
 sudo install -m 755 build/libasound_module_pcm_ampdac.so \
     /usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)/alsa-lib/
 sudo install -m 644 alsa/50-ampdac.conf /usr/share/alsa/alsa.conf.d/50-ampdac.conf
@@ -52,6 +53,13 @@ sudo install -m 644 udev/99-ampdac.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb
 sudo systemctl daemon-reload
 sudo systemctl enable --now ampdac.socket
+sudo usermod -aG audio "$USER"   # then log in again
+```
+
+The same install is the Debian package `dist/ampdac_0.3.18-1_amd64.deb`:
+
+```bash
+sudo apt install ./dist/ampdac_0.3.18-1_amd64.deb
 sudo usermod -aG audio "$USER"   # then log in again
 ```
 
@@ -73,11 +81,78 @@ audio_output {
 
 Moode rewrites `mpd.conf`; put the same block back after it does.
 
-Volumio: install this package first, then the plugin in `volumio/ampdac`
-(Miscellanea). It enables the socket and appends that output to MPD and to
-Volumio's template. Volume on this path is unity.
+Volumio (Raspberry Pi, 32- or 64-bit) does not need a compiler. Build the
+plugin zip on a PC with `scripts/build-volumio-plugin.sh`, copy
+`dist/ampdac-volumio.zip` to the Pi, open `http://volumio.local/dev` and
+upload that zip. Enable the plugin, open Playback Options and pick
+**ampdac USB DAC** next to the kernel card. MPD still opens the PCM
+`volumio`; while that entry is selected, `/etc/asound.conf` points it at
+the `ampdac` plugin. The kernel card stays in the list for the driver path.
 
 `./build/ipc_smoke ./build/ampdacd` checks the socket without a DAC.
+
+## Utilities
+
+`/usr/bin/ampdac` is the same program on Debian and on Volumio. Both
+commands print English. `show transport` needs `python3`. The caller must
+be in group `audio`, because `/run/ampdac.sock` is mode `0660`.
+
+`ampdac show status` says which output is actually open. It lists kernel
+cards, whether `ampdacd` is running, and the name of the player holding the
+socket. On Volumio it also prints the web label, the `volumio` PCM route,
+and the MPD outputs, because those three can disagree. On a normal Debian
+install those Volumio blocks are omitted. If `/etc/mpd.conf` exists, its
+outputs are still listed.
+
+`ampdac show transport` asks `ampdacd` for one screen: the DAC name, USB
+id, clocking, channel count, PCM rates and bit depths, whether native DSD
+and DoP are advertised, then the live stream, the feedback clock, the ring
+and the loss count. Nothing playing is `playback: idle`. On Volumio, if the
+plugin route is not `ampdac`, it adds `plugin: inactive` and names the
+kernel card when that card is the one playing.
+
+`ampdac-cli` is a separate player, not one of those two commands. `list`
+and `probe` describe the attached UAC2 DAC. `play` and `tone` send audio
+through `libampdac` directly. `play` needs `ffmpeg` on `PATH`.
+
+## Hardware
+
+The transport opens one class-compliant **USB Audio Class 2** DAC and
+sends isochronous audio itself. It is built for the asynchronous case:
+the DAC crystal is clock master and the device provides an explicit
+feedback endpoint. PCM keeps the file rate. 16-bit and 24-bit samples
+are placed in the top of a 4-byte slot; the lower bits stay zero at
+unity gain. If the DAC publishes both a 24-bit and a 32-bit 4-byte
+alternate, 24-bit PCM uses the 24-bit one, because the 32-bit alternate
+on some DACs plays the padding byte. A packed 3-byte slot is used only
+when that rate and channel count have no 4-byte PCM alternate. Native
+DSD is used when a RAW / Type IV alternate is advertised. Otherwise
+DSD64, DSD128 and DSD256 go out as DoP on a 4-byte PCM alternate.
+Stereo only. One client owns the DAC.
+
+Brought up on a FiiO K7, both as the kernel card and through this
+transport, on Volumio and on Debian.
+
+It will not play:
+
+- A USB Audio Class 1 device. Interfaces whose protocol is not UAC2
+  (`0x20`) are skipped.
+- Anything that is not a USB DAC: I2S HATs, HDMI, analogue jacks,
+  S/PDIF-only converters.
+- A PCM DAC whose only subslot is 2 bytes. The formatter accepts a
+  4-byte slot, and a 3-byte slot only as the fallback above.
+- DSD512 or any DSD rate other than DSD64, DSD128 and DSD256.
+- DoP into a DAC that has no 4-byte PCM alternate. The DoP marker lives
+  in the top byte of that slot, so the packed 3-byte fallback cannot
+  carry it.
+- More than two channels. DSD is rejected unless it is stereo, and the
+  ALSA device `ampdac` accepts two channels only.
+- A second player while the first still holds the DAC.
+- Windows or macOS. The daemon is Linux, libusb and systemd.
+
+An adaptive or synchronous UAC2 endpoint can still be opened, but it is
+not the clock-master path. The bit-perfect claim (DAC crystal, explicit
+feedback, file rate unchanged) is for asynchronous feedback devices.
 
 ## USB permission
 
@@ -134,8 +209,8 @@ The plugin enables FFmpeg DoP so DSF/DFF are not converted to float.
 
 Format changes (44.1 → 96, DSD → FLAC) retune the PLL; that is a new session.
 
-`ampdac_write` blocks while the ring is full, up to about 2 s since the last
-successful push, then returns `AMPDAC_ERR_TIMEOUT`. It does not return a short
+`ampdac_write` blocks while the ring is full. The whole call gives up after
+about 2 s and returns `AMPDAC_ERR_TIMEOUT`. It does not return a short
 count for back-pressure. A short non-negative count means only that the tail
 was not a whole sample frame; pass that tail again with the next buffer.
 
@@ -158,8 +233,8 @@ was not a whole sample frame; pass that tail again with the next buffer.
 
 ## Scope
 
-- Class-compliant **UAC2** High-Speed, stereo, 4-byte Type-I PCM
-- Native DSD when a RAW/TYPE_IV alt exists, else DoP
+- Class-compliant **UAC2**, stereo. Normal PCM is a 4-byte Type I slot; a 3-byte slot is only the fallback described above
+- Native DSD when a RAW/TYPE_IV alt exists, else DoP, DSD64/128/256
 - One DAC at a time, exclusive libusb
 - No resample, unity volume on the USB wire
 

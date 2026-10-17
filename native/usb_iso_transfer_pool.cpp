@@ -8,6 +8,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "usb_iso_transfer_pool.h"
+#include "dop_formatter.h"
+#include "dsd_wire_mode.h"
 #include "spsc_ring_buffer.h"
 #include "uac2_descriptor_parser.h"
 
@@ -80,8 +82,12 @@ static uint32_t compute_bytes_per_uframe(uint32_t sample_rate_hz,
 {
     // samples_per_uframe_ceil = ceil(sample_rate_hz / USB_HS_UFRAMES_PER_SEC)
     // Integer ceiling: (a + b - 1) / b
+    /* +12.5% is the feedback window we accept. Without this headroom a
+     * 48/96/192 kHz stream has ceil(rate/8000) == rate/8000, and every
+     * feedback reading above nominal is clipped by one frame — a tick. */
+    const uint32_t padded = sample_rate_hz + (sample_rate_hz / 8U);
     const uint32_t samples_ceil =
-        (sample_rate_hz + USB_HS_UFRAMES_PER_SEC - 1U) / USB_HS_UFRAMES_PER_SEC;
+        (padded + USB_HS_UFRAMES_PER_SEC - 1U) / USB_HS_UFRAMES_PER_SEC;
 
     return samples_ceil * bytes_per_audio_frame;
 }
@@ -155,8 +161,10 @@ uint32_t IsoTransferPool::compute_next_transfer_lengths(
             uint32_t frames = feedback_phase_ >> 16U;
             feedback_phase_ &= 0xFFFFU;
             if (frames < 1U) frames = 1U;
-            uint32_t bytes = frames * bpf;
-            if (bytes > bytes_per_uframe_) bytes = bytes_per_uframe_;
+            const uint32_t max_frames =
+                    bpf > 0U ? bytes_per_uframe_ / bpf : frames;
+            if (max_frames > 0U && frames > max_frames) frames = max_frames;
+            const uint32_t bytes = frames * bpf;
             packet_lengths_out[p] = bytes;
             total += bytes;
         }
@@ -195,7 +203,13 @@ void IsoTransferPool::accept_feedback_bytes(const uint8_t *data, int length) noe
                    (static_cast<uint32_t>(data[2]) << 16U);
     if (length >= 4) {
         raw |= static_cast<uint32_t>(data[3]) << 24U;
+        /* UAC2 HS feedback is 16.16 in the low 28 bits. The top nibble is
+         * reserved; snd-usb-audio masks it off before the range check. */
+        raw &= 0x0FFFFFFFU;
+    } else {
+        raw &= 0x00FFFFFFU;
     }
+    if (raw == 0U) return;
 
     const uint32_t nominal = static_cast<uint32_t>(
             (static_cast<uint64_t>(cfg_.sample_rate_hz) << 16U) /
@@ -204,15 +218,37 @@ void IsoTransferPool::accept_feedback_bytes(const uint8_t *data, int length) noe
     const uint32_t slack = nominal / 8U;  // ±12.5%, same window as ALSA usb audio
     const uint32_t lo = (nominal > slack) ? (nominal - slack) : 1U;
     const uint32_t hi = nominal + slack;
+    /* Detection window matches snd-usb-audio: -25% .. +50%. A word only
+     * becomes the clock if it also lands in the ±12.5% window we can send. */
+    const uint32_t detect_lo = nominal - nominal / 4U;
+    const uint32_t detect_hi = nominal + nominal / 2U;
+
+    uint32_t f = raw;
+    if (!feedback_shift_valid_) {
+        int shift = 0;
+        while (shift < 16 && f < detect_lo) {
+            f <<= 1U;
+            ++shift;
+        }
+        while (shift > -16 && f > detect_hi) {
+            f >>= 1U;
+            --shift;
+        }
+        feedback_shift_ = shift;
+        feedback_shift_valid_ = true;
+    } else if (feedback_shift_ > 0) {
+        f <<= static_cast<unsigned>(feedback_shift_);
+    } else if (feedback_shift_ < 0) {
+        f >>= static_cast<unsigned>(-feedback_shift_);
+    }
 
     uint32_t q1616 = 0U;
-    if (raw >= lo && raw <= hi) {
-        q1616 = raw;
+    if (f >= lo && f <= hi) {
+        q1616 = f;
     } else {
-        const uint32_t shifted = raw << 2U;  // 10.14 → 16.16
-        if (shifted >= lo && shifted <= hi) {
-            q1616 = shifted;
-        }
+        /* Format guess was wrong, or this one word is garbage. Keep the
+         * previous clock and learn the shift again next time. */
+        feedback_shift_valid_ = false;
     }
     if (q1616 == 0U) {
         // Feedback IN completes every bInterval. Log the first rejects and
@@ -228,7 +264,18 @@ void IsoTransferPool::accept_feedback_bytes(const uint8_t *data, int length) noe
         }
         return;
     }
-    const uint32_t previous = feedback_q16_16_.exchange(q1616, std::memory_order_relaxed);
+    const uint32_t previous = feedback_q16_16_.load(std::memory_order_relaxed);
+    if (previous != 0U) {
+        /* A one-step jump of a whole sample is a tick. Track the DAC, but
+         * don't let one noisy feedback word resize the next microframe. */
+        int32_t delta = static_cast<int32_t>(q1616) - static_cast<int32_t>(previous);
+        int32_t max_step = static_cast<int32_t>(nominal / 32U);
+        if (max_step < 1) max_step = 1;
+        if (delta > max_step) delta = max_step;
+        if (delta < -max_step) delta = -max_step;
+        q1616 = static_cast<uint32_t>(static_cast<int32_t>(previous) + delta);
+    }
+    feedback_q16_16_.store(q1616, std::memory_order_relaxed);
     if (previous == 0U) {
         const double frames = static_cast<double>(q1616) / 65536.0;
         PLOGI("IsoTransferPool: DAC clock master — first feedback Q16.16=0x%08X "
@@ -543,19 +590,16 @@ void iso_transfer_callback(libusb_transfer *transfer)
         ++slot->consecutive_errors;
 
         if (slot->consecutive_errors >= TransferSlot::MAX_CONSECUTIVE_ERRORS) {
-            // Sustained bus fault — stop re-submitting to prevent a tight loop.
-            // Log once; subsequent callbacks on this slot will hit the shutdown
-            // guard at step 1 and return silently.
+            /* Keep the URB. Retiring it leaves a hole for the rest of the
+             * session, and the next track inherits the short queue. */
             __android_log_print(ANDROID_LOG_ERROR, POOL_TAG,
-                                "slot[%u] %u consecutive errors — shutting down slot "
+                                "slot[%u] %u consecutive errors — resubmitting "
                                 "(transfer status=%d  packet_errors=%u)",
                                 slot->index,
                                 slot->consecutive_errors,
                                 static_cast<int>(transfer->status),
                                 packet_errors);
-            slot->shutdown.store(true,  std::memory_order_release);
-            slot->in_flight.store(false, std::memory_order_release);
-            return;
+            slot->consecutive_errors = 0;
         }
     }
 
@@ -619,7 +663,9 @@ void iso_transfer_callback(libusb_transfer *transfer)
 
     SpscRingBuffer *const ring = slot->pool->ring_buffer();
 
-    if (__builtin_expect(ring != nullptr, 1)) {
+    if (slot->pool->render_pcm_fade(buf8, required)) {
+        /* Track change: finish the ramp before taking any new samples. */
+    } else if (__builtin_expect(ring != nullptr, 1)) {
         // ── Fast path: ring has a full transfer's worth of decoded audio ──────
         if (!ring->pop(buf8, required)) {
             // ── Underrun path ─────────────────────────────────────────────────
@@ -635,13 +681,10 @@ void iso_transfer_callback(libusb_transfer *transfer)
             if (partial > 0) {
                 // Partial fill: copy available bytes to the front of the buffer.
                 ring->pop(buf8, partial);
-                // Pad the unfilled tail so the DAC receives a valid-length
-                // transfer carrying silence for the missing samples.
-                slot->pool->fill_idle(buf8 + partial, required - partial);
-            } else {
-                // Ring is completely empty — output a full silence frame.
-                slot->pool->fill_idle(buf8, required);
             }
+            // Pad whatever the ring could not supply. DoP padding continues
+            // the marker already in this buffer.
+            slot->pool->fill_gap(buf8, partial, required);
 
             // Signal the monitoring layer.  relaxed ordering is correct: this
             // counter has no happens-before relationship with audio data.
@@ -664,10 +707,18 @@ void iso_transfer_callback(libusb_transfer *transfer)
         // On successful pop(): buf8 holds exactly `required` bytes of
         // decoded PCM / DoP audio, DMA-ready for the USB host controller.
     } else {
-        // Ring not yet attached (pre-playback or post-teardown state).
-        // Output silence so the DAC clock keeps running cleanly.
-        slot->pool->fill_idle(buf8, required);
+        // Ring not yet attached. DoP silence has to keep the marker the
+        // stream was already using; a pattern that restarts at 0x05 unlocks
+        // the DAC when the previous frame ended on 0xFA.
+        if (slot->pool->idle_is_dop()) {
+            slot->pool->fill_gap(buf8, 0, required);
+        } else {
+            slot->pool->fill_idle(buf8, required);
+        }
     }
+    slot->pool->observe_dop_pcm(buf8, required);
+    slot->pool->restamp_dop(buf8, required);
+    slot->pool->note_pcm_tail(buf8, required);
 
     // ── 7. Apply Bresenham packet lengths to the transfer descriptor ──────────
     //
@@ -724,6 +775,12 @@ IsoTransferPool::IsoTransferPool(const IsoTransferPoolConfig &cfg) noexcept
     // validates cfg before calling the constructor.
     bytes_per_uframe_    = compute_bytes_per_uframe(cfg_.sample_rate_hz,
                                                     cfg_.bytes_per_audio_frame);
+    if (cfg_.max_packet_bytes >= cfg_.bytes_per_audio_frame &&
+        bytes_per_uframe_ > cfg_.max_packet_bytes) {
+        bytes_per_uframe_ =
+                (cfg_.max_packet_bytes / cfg_.bytes_per_audio_frame) *
+                cfg_.bytes_per_audio_frame;
+    }
     buffer_size_per_xfer_ = bytes_per_uframe_ * cfg_.packets_per_transfer;
 }
 
@@ -1137,8 +1194,44 @@ bool IsoTransferPool::allocate(libusb_device_handle *handle, std::string *error_
  *
  * @return  Number of successfully submitted slots, or -1 on the first failure.
  */
+void IsoTransferPool::prime_out_buffers() noexcept
+{
+    SpscRingBuffer *const ring = ring_buffer();
+    const auto n = static_cast<std::size_t>(audio_slot_count_);
+    for (std::size_t i = 0; i < n && i < transfers_.size(); ++i) {
+        libusb_transfer *const transfer = transfers_[i];
+        if (transfer == nullptr || transfer->buffer == nullptr) continue;
+        uint32_t lens[kMaxBresPackets];
+        const uint32_t total = compute_next_transfer_lengths(lens);
+        auto *const buf = reinterpret_cast<uint8_t *>(transfer->buffer);
+        bool from_ring = false;
+        if (!render_pcm_fade(buf, total)) {
+            if (ring != nullptr && total > 0U && ring->pop(buf, total)) {
+                from_ring = true;
+            } else if (idle_is_dop()) {
+                fill_gap(buf, 0, total);
+            } else {
+                fill_idle(buf, total);
+            }
+        }
+        if (from_ring) observe_dop_pcm(buf, total);
+        restamp_dop(buf, total);
+        note_pcm_tail(buf, total);
+        transfer->length = static_cast<int>(total);
+        const int packets = std::min(transfer->num_iso_packets,
+                                     static_cast<int>(kMaxBresPackets));
+        for (int p = 0; p < packets; ++p) {
+            transfer->iso_packet_desc[p].length = lens[p];
+        }
+    }
+}
+
 int IsoTransferPool::submit_all_transfers() noexcept
 {
+    /* Fill before any submit. A callback can run as soon as the first URB
+     * is queued, and the ring has a single consumer. */
+    prime_out_buffers();
+
     int submitted = 0;
     const auto n = static_cast<std::size_t>(audio_slot_count_);
 
@@ -1366,6 +1459,160 @@ void IsoTransferPool::clear_dsd_observation_window() noexcept
  *
  * Precondition (documented on the declaration): no transfer in flight.
  */
+void IsoTransferPool::remember_dop_marker(const uint8_t *buf, std::size_t n) noexcept
+{
+    if (silence_pattern_len_ <= 1U || buf == nullptr || n < 8U) return;
+    const std::size_t aligned = n - (n % 8U);
+    if (aligned < 8U) return;
+    last_dop_marker_.store(buf[aligned - 8U + 3U], std::memory_order_relaxed);
+}
+
+void IsoTransferPool::observe_dop_pcm(const uint8_t *buf, std::size_t n) noexcept
+{
+    if (stream_is_dop_.load(std::memory_order_relaxed)) return;
+    if (buf == nullptr || n < 32U || cfg_.bytes_per_audio_frame != 8U) return;
+    uint8_t marker = buf[3];
+    if (marker != kDopMarkerA && marker != kDopMarkerB) return;
+    for (std::size_t off = 0; off < 32U; off += 8U) {
+        if (buf[off + 3U] != marker || buf[off + 7U] != marker) return;
+        marker = static_cast<uint8_t>(marker ^ kDopToggleMask);
+    }
+    stream_is_dop_.store(true, std::memory_order_release);
+}
+
+void IsoTransferPool::restamp_dop(uint8_t *buf, std::size_t n) noexcept
+{
+    if (!idle_is_dop() || buf == nullptr || n < 8U) return;
+    uint8_t marker = kDopMarkerA;
+    const uint8_t last = last_dop_marker_.load(std::memory_order_relaxed);
+    if (last == kDopMarkerA || last == kDopMarkerB) {
+        marker = static_cast<uint8_t>(last ^ kDopToggleMask);
+    }
+    for (std::size_t off = 0; off + 8U <= n; off += 8U) {
+        buf[off + 3U] = marker;
+        buf[off + 7U] = marker;
+        marker = static_cast<uint8_t>(marker ^ kDopToggleMask);
+    }
+    last_dop_marker_.store(static_cast<uint8_t>(marker ^ kDopToggleMask),
+                           std::memory_order_relaxed);
+}
+
+void IsoTransferPool::note_pcm_tail(const uint8_t *buf, std::size_t n) noexcept
+{
+    if (buf == nullptr || idle_is_dop()) return;
+    if (silence_byte_.load(std::memory_order_relaxed) != 0) return;
+    if (cfg_.bytes_per_audio_frame != 8U || n < 8U) return;
+    const std::size_t off = (n - (n % 8U)) - 8U;
+    int32_t left = 0;
+    int32_t right = 0;
+    std::memcpy(&left, buf + off, 4);
+    std::memcpy(&right, buf + off + 4, 4);
+    last_pcm_l_.store(left, std::memory_order_relaxed);
+    last_pcm_r_.store(right, std::memory_order_relaxed);
+}
+
+void IsoTransferPool::request_pcm_fade(int frames) noexcept
+{
+    if (frames < 1 || cfg_.bytes_per_audio_frame != 8U) return;
+    if (idle_is_dop()) return;
+    if (silence_byte_.load(std::memory_order_relaxed) != 0) return;
+    fade_total_ = frames;
+    fade_request_.store(1, std::memory_order_release);
+}
+
+bool IsoTransferPool::render_pcm_fade(uint8_t *dst, std::size_t n) noexcept
+{
+    if (idle_is_dop()) {
+        fade_request_.store(0, std::memory_order_relaxed);
+        fade_left_.store(0, std::memory_order_relaxed);
+        return false;
+    }
+    if (fade_request_.load(std::memory_order_acquire) != 0) {
+        fade_request_.store(0, std::memory_order_relaxed);
+        fade_origin_l_ = last_pcm_l_.load(std::memory_order_relaxed);
+        fade_origin_r_ = last_pcm_r_.load(std::memory_order_relaxed);
+        const int total = fade_total_ > 0 ? fade_total_ : 1;
+        fade_total_ = total;
+        fade_left_.store(total, std::memory_order_relaxed);
+    }
+    int left = fade_left_.load(std::memory_order_relaxed);
+    if (left <= 0 || dst == nullptr || n == 0U) return false;
+    if (cfg_.bytes_per_audio_frame != 8U) {
+        fade_left_.store(0, std::memory_order_relaxed);
+        return false;
+    }
+    const int total = fade_total_ > 0 ? fade_total_ : left;
+    const std::size_t frames = n / 8U;
+    std::size_t frame = 0;
+    while (frame < frames && left > 0) {
+        const int32_t l = static_cast<int32_t>(
+                (static_cast<int64_t>(fade_origin_l_) * left) / total);
+        const int32_t r = static_cast<int32_t>(
+                (static_cast<int64_t>(fade_origin_r_) * left) / total);
+        std::memcpy(dst + frame * 8U, &l, 4);
+        std::memcpy(dst + frame * 8U + 4U, &r, 4);
+        --left;
+        ++frame;
+    }
+    if (frame * 8U < n) {
+        std::memset(dst + frame * 8U, 0, n - frame * 8U);
+    }
+    fade_left_.store(left, std::memory_order_relaxed);
+    return true;
+}
+
+void IsoTransferPool::fill_gap(uint8_t *buf, std::size_t have, std::size_t need) noexcept
+{
+    if (buf == nullptr || need <= have) return;
+    if (!idle_is_dop()) {
+        /* A hole of digital zeros is a tick. Hold the last sample across it. */
+        if (cfg_.bytes_per_audio_frame == 8U) {
+            uint8_t frame[8];
+            std::size_t dst = have;
+            if (have >= 8U) {
+                dst = have - (have % 8U);
+                std::memcpy(frame, buf + dst - 8U, 8U);
+            } else {
+                const int32_t left = last_pcm_l_.load(std::memory_order_relaxed);
+                const int32_t right = last_pcm_r_.load(std::memory_order_relaxed);
+                std::memcpy(frame, &left, 4U);
+                std::memcpy(frame + 4U, &right, 4U);
+                dst = 0;
+            }
+            while (dst + 8U <= need) {
+                std::memcpy(buf + dst, frame, 8U);
+                dst += 8U;
+            }
+            if (dst < need) std::memset(buf + dst, 0, need - dst);
+        } else {
+            fill_idle(buf + have, need - have);
+        }
+        return;
+    }
+
+    std::size_t dst = have;
+    uint8_t marker = kDopMarkerA;
+    if (have >= 8U) {
+        dst = have - (have % 8U);
+        marker = static_cast<uint8_t>(buf[dst - 8U + 3U] ^ kDopToggleMask);
+    } else {
+        const uint8_t last = last_dop_marker_.load(std::memory_order_relaxed);
+        if (last == kDopMarkerA || last == kDopMarkerB) {
+            marker = static_cast<uint8_t>(last ^ kDopToggleMask);
+        }
+        dst = 0;
+    }
+    while (dst + 8U <= need) {
+        std::size_t frames = (need - dst) / 8U;
+        if (frames > 64U) frames = 64U;
+        marker = fill_dop_idle_stereo(buf + dst, frames, marker);
+        dst += frames * 8U;
+    }
+    if (dst < need) {
+        std::memset(buf + dst, kNativeDsdSilenceByte, need - dst);
+    }
+}
+
 void IsoTransferPool::fill_idle(uint8_t *dst, std::size_t n) noexcept
 {
     if (dst == nullptr || n == 0U) return;

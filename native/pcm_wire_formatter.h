@@ -12,6 +12,8 @@
 enum class PcmSourceEncoding : uint8_t {
     S16Le,
     S32Le,
+    /** Three bytes, little-endian, sign in the top bit of the third byte. */
+    S24_3Le,
 };
 
 /**
@@ -23,8 +25,10 @@ struct PcmFormatResult {
 };
 
 /**
- * Converts decoded integer PCM into the negotiated MSB-aligned four-byte UAC2
- * subslot without allocating on the audio thread.
+ * Converts decoded integer PCM into the negotiated UAC2 subslot without
+ * allocating on the audio thread. The usual slot is four bytes, MSB-aligned.
+ * Three bytes is packed 24-bit, used only when the DAC has no four-byte PCM
+ * alternate.
  *
  * Unity gain has an explicit integer-only path so a bit-perfect claim can be
  * verified byte-for-byte. Attenuated S16 input is promoted before gain is
@@ -73,6 +77,21 @@ public:
 
 private:
     [[nodiscard]] int32_t quantize_to_valid_bits(int64_t sample) const noexcept;
+
+    [[nodiscard]] PcmFormatResult format_subslot3(
+            const uint8_t *input,
+            std::size_t input_bytes,
+            PcmSourceEncoding encoding,
+            double gain,
+            uint8_t *output,
+            std::size_t output_capacity) const noexcept;
+
+    [[nodiscard]] PcmFormatResult format_float32_subslot3(
+            const uint8_t *input,
+            std::size_t input_bytes,
+            double gain,
+            uint8_t *output,
+            std::size_t output_capacity) const noexcept;
 
     UsbPcmWireFormat format_;
 };

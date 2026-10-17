@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=usb || true
+    fi
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl enable ampdac.socket >/dev/null 2>&1 || true
+        systemctl restart ampdac.socket >/dev/null 2>&1 || true
+    fi
+    echo "ampdac: players and 'ampdac show transport' need the audio group."
+    echo "ampdac: sudo usermod -aG audio \$USER   then log in again."
+fi
+
+exit 0

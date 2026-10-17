@@ -1,0 +1,11 @@
+[Unit]
+Description=Point Volumio PCM volumio at ampdac
+After=local-fs.target
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ampdac-asound apply
+
+[Install]
+WantedBy=multi-user.target

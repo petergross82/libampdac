@@ -1,0 +1,12 @@
+[Unit]
+Description=ampdac UAC2 transport socket
+
+[Socket]
+ListenStream=/run/ampdac.sock
+# 0660 root:audio is not enough: MPD drops to user mpd and is not always in
+# group audio, and the plugin reports every connect failure as ENOENT.
+SocketMode=0666
+Accept=no
+
+[Install]
+WantedBy=sockets.target

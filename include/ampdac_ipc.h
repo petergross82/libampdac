@@ -38,6 +38,9 @@ enum ampdac_ipc_type {
     AMPDAC_IPC_CLOSE = 6,
     AMPDAC_IPC_NEGOTIATED = 7,
     AMPDAC_IPC_STATS = 8,
+    AMPDAC_IPC_DROP = 9,
+    /** Any connection may ask. Does not take the DAC. Text reply. */
+    AMPDAC_IPC_PEEK = 10,
 };
 
 struct ampdac_ipc_hdr {
@@ -117,6 +120,9 @@ ampdac_status ampdac_client_configure_dsd(ampdac_client *client,
                                           const ampdac_dsd_config *config);
 
 ampdac_status ampdac_client_start(ampdac_client *client);
+
+/** Discard queued audio. The USB session stays open. */
+ampdac_status ampdac_client_drop(ampdac_client *client);
 
 int ampdac_client_write(ampdac_client *client, const void *pcm, size_t bytes);
 

@@ -17,7 +17,8 @@
 #include <pthread.h>     // pthread_setname_np, pthread_setschedparam
 #include <sched.h>       // SCHED_FIFO, sched_get_priority_min
 #include <sys/resource.h> // setpriority, PRIO_PROCESS
-#include <unistd.h>      // gettid
+#include <sys/syscall.h>  // SYS_gettid
+#include <unistd.h>       // syscall
 
 #include "libusb/libusb.h"
 
@@ -214,7 +215,7 @@ void LibusbEventThread::thread_fn() noexcept
     pthread_setname_np(pthread_self(), "usb_ev");
 
     ELOGI("event thread started  tid=%d  keep_running=%d",
-          static_cast<int>(gettid()),
+          static_cast<int>(syscall(SYS_gettid)),
           keep_running_.load(std::memory_order_relaxed) ? 1 : 0);
 
     // ── 2. Best-effort real-time priority elevation ───────────────────────────
@@ -323,6 +324,6 @@ void LibusbEventThread::thread_fn() noexcept
     running_.store(false, std::memory_order_release);
 
     ELOGI("event thread exited cleanly  tid=%d  total_errors=%u",
-          static_cast<int>(gettid()),
+          static_cast<int>(syscall(SYS_gettid)),
           error_count_.load(std::memory_order_relaxed));
 }

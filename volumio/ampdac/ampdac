@@ -1,0 +1,651 @@
+#!/bin/bash
+# ampdac show status | ampdac show transport
+# Same commands on Volumio and on a normal Linux install.
+# status: which output is open (kernel card or ampdacd).
+# transport: DAC descriptor, stream, clock and losses from ampdacd.
+# Volumio-only lines (plugin route, web label) appear only when that install is present.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /bin/bash "$0" "$@"
+fi
+set -eu
+
+usage() {
+    echo "usage: ampdac show status"
+    echo "       ampdac show transport"
+    echo "       ampdac status"
+}
+
+json_value() {
+    local file="$1" key="$2"
+    [ -r "$file" ] || return 0
+    awk -v key="$key" '
+        function qvalue(s,    p, rest, q) {
+            p = index(s, "\"value\"")
+            if (p == 0) return ""
+            rest = substr(s, p + 7)
+            p = index(rest, "\"")
+            if (p == 0) return ""
+            rest = substr(rest, p + 1)
+            q = index(rest, "\"")
+            if (q <= 1) return ""
+            return substr(rest, 1, q - 1)
+        }
+        BEGIN { want = "\"" key "\""; left = 0 }
+        {
+            if (index($0, want) && index($0, ":")) {
+                v = qvalue($0)
+                if (v != "") { print v; exit }
+                left = 6
+                next
+            }
+            if (left > 0) {
+                left--
+                v = qvalue($0)
+                if (v != "") { print v; exit }
+            }
+        }
+    ' "$file"
+}
+
+# True when the Volumio plugin is installed. A desktop Debian box has neither.
+volumio_here() {
+    [ -x /usr/local/sbin/ampdac-asound ] && return 0
+    [ -e /data/configuration/audio_interface/alsa_controller/config.json ] && return 0
+    return 1
+}
+
+# Player that holds /run/ampdac.sock. ss -p sees the process when it belongs
+# to the caller or when this runs as root. The Volumio report is the fallback.
+detect_client() {
+    local player
+    player="$(ss -xHp 2>/dev/null | awk '
+        index($0, "/run/ampdac.sock") && index($0, "ESTAB") {
+            if (match($0, /\* [0-9]+/)) {
+                want[substr($0, RSTART + 2, RLENGTH - 2)] = 1
+            }
+        }
+        { lines[++n] = $0 }
+        END {
+            for (i = 1; i <= n; i++) {
+                line = lines[i]
+                if (index(line, "ESTAB") == 0 || index(line, "ampdacd")) continue
+                hit = 0
+                for (ino in want) {
+                    if (index(line, "* " ino " *")) hit = 1
+                }
+                if (!hit) continue
+                name = ""
+                pid = ""
+                if (match(line, /users:\(\("[^"]+"/)) {
+                    name = substr(line, RSTART, RLENGTH)
+                    sub(/^users:\(\("/, "", name)
+                    sub(/"$/, "", name)
+                }
+                if (match(line, /pid=[0-9]+/)) {
+                    pid = substr(line, RSTART + 4, RLENGTH - 4)
+                }
+                if (name != "") {
+                    printf "%s|%s\n", name, pid
+                    exit
+                }
+            }
+        }
+    ' || true)"
+    if [ -n "$player" ]; then
+        client_name="${player%%|*}"
+        client_pid="${player#*|}"
+        client_open=1
+        return 0
+    fi
+    if [ "${client_open:-0}" -eq 0 ] && [ -r /proc/net/unix ] \
+        && awk '$NF == "/run/ampdac.sock" && $6 == "03" { found = 1 } END { exit found ? 0 : 1 }' /proc/net/unix; then
+        client_open=1
+    fi
+}
+
+# Fills mpd_rows / mpd_state from /etc/mpd.conf. Same on Volumio and Debian.
+load_mpd() {
+    local file="$1"
+    if [ -r "$file" ]; then
+        mpd_rows=$(awk '
+            /^[[:space:]]*audio_output[[:space:]]*\{/ {
+                inblk = 1
+                name = ""
+                device = ""
+                enabled = "yes"
+                dop = ""
+                next
+            }
+            inblk && /^[[:space:]]*}/ {
+                printf "%s|%s|%s|%s\n", name, device, enabled, dop
+                inblk = 0
+                next
+            }
+            inblk && /^[[:space:]]*(name|device|enabled|dop)[[:space:]]+"/ {
+                key = $1
+                line = $0
+                sub(/^[^"]*"/, "", line)
+                sub(/".*$/, "", line)
+                if (key == "name") name = line
+                else if (key == "device") device = line
+                else if (key == "enabled") enabled = line
+                else if (key == "dop") dop = line
+                next
+            }
+        ' "$file")
+        if [ -z "$mpd_rows" ]; then
+            mpd_state=empty
+            mpd_bytes=$(wc -c < "$file" | tr -d ' ')
+            mpd_hits=$(grep -c audio_output "$file" || true)
+        fi
+    elif [ -f "$file" ]; then
+        mpd_state=unreadable
+    else
+        mpd_state=missing
+    fi
+}
+
+# Sound is not going through ampdac. On Volumio that means the plugin route
+# is off. On any system, name the kernel card when one is actually playing.
+note_bypass() {
+    if volumio_here && [ "$route" != "ampdac" ]; then
+        echo "plugin: inactive"
+    fi
+    local kernel
+    kernel="$(kernel_card || true)"
+    if [ -n "$kernel" ]; then
+        echo "kernel card \"$kernel\" is playing"
+    fi
+}
+
+cmd_status() {
+    local cards_file=/proc/asound/cards
+    local asound=/etc/asound.conf
+    local vconf=/data/configuration/audio_interface/alsa_controller/config.json
+    local mpd=/etc/mpd.conf
+    local route="missing"
+    local route_card=""
+    local web_name=""
+    local web_id=""
+    local web_card=""
+    local playing=""
+    local daemon=""
+    local client_name=""
+    local client_pid=""
+    local client_open=0
+    local report="" web_state="" web_snip="" mpd_state="" mpd_rows="" mpd_bytes="" mpd_hits="" mpd_warn="" got_report=0
+
+    if [ -x /usr/local/sbin/ampdac-asound ]; then
+        if report="$(sudo -n /usr/local/sbin/ampdac-asound report 2>/dev/null)" \
+            && printf '%s\n' "$report" | grep -q '^route|'; then
+            got_report=1
+        fi
+    fi
+    if [ "$got_report" -eq 1 ]; then
+        local line kind a b c d
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            IFS='|' read -r kind a b c d <<<"$line"
+            case "$kind" in
+                route)
+                    route="$a"
+                    route_card="$b"
+                    ;;
+                web)
+                    web_state=ok
+                    web_name="$a"
+                    web_id="$b"
+                    web_card="$c"
+                    ;;
+                webstate) web_state="$a" ;;
+                websnippet) web_snip="$a" ;;
+                mpd)
+                    mpd_rows="${mpd_rows}${mpd_rows:+$'\n'}$a|$b|$c|$d"
+                    ;;
+                mpdwarn)
+                    mpd_warn="$a"
+                    ;;
+                mpdstate)
+                    mpd_state="$a"
+                    mpd_bytes="$b"
+                    mpd_hits="$c"
+                    ;;
+                client)
+                    client_name="$a"
+                    client_pid="$b"
+                    client_open=1
+                    ;;
+            esac
+        done <<<"$report"
+    fi
+    if [ -z "$client_name" ] || [ "$client_name" = "open" ]; then
+        detect_client
+    fi
+
+    echo "=== open now ==="
+    if [ -d /proc/asound ]; then
+        local st card name id owner comm
+        local found=0
+        for st in /proc/asound/card*/pcm*p/sub*/status; do
+            [ -f "$st" ] || continue
+            grep -q '^state:[[:space:]]*RUNNING' "$st" || continue
+            found=1
+            card=$(echo "$st" | sed -n 's#/proc/asound/card\([0-9]*\)/.*#\1#p')
+            id=""
+            name=""
+            if [ -f "$cards_file" ]; then
+                id=$(awk -v n="$card" '
+                    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+                    $1 == n {
+                        if (match($0, /\[[^]]+\]/)) {
+                            print trim(substr($0, RSTART + 1, RLENGTH - 2))
+                        }
+                        exit
+                    }
+                ' "$cards_file")
+                name=$(awk -v n="$card" '
+                    $1 == n {
+                        line = $0
+                        p = index(line, "]:")
+                        if (p > 0) line = substr(line, p + 2)
+                        sub(/^[ \t]+/, "", line)
+                        sub(/^[^ ]* - /, "", line)
+                        print line
+                        exit
+                    }
+                ' "$cards_file")
+            fi
+            owner=$(awk '/^owner_pid/{print $NF}' "$st")
+            comm=""
+            if [ -n "$owner" ] && [ -r "/proc/$owner/comm" ]; then
+                comm=$(cat "/proc/$owner/comm" 2>/dev/null || true)
+            fi
+            echo "kernel: card $card [$id] $name${owner:+  pid $owner}${comm:+ $comm}"
+            playing="kernel card $card [$id]"
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "kernel: no card is playing"
+        fi
+    else
+        echo "kernel: /proc/asound is missing"
+    fi
+
+    if pgrep -a ampdacd >/dev/null 2>&1; then
+        daemon=$(pgrep -a ampdacd | head -1)
+        echo "ampdacd: $daemon"
+    else
+        echo "ampdacd: not running"
+    fi
+    if [ "$client_open" -eq 1 ]; then
+        if [ -n "$client_name" ] && [ "$client_name" != "open" ]; then
+            echo "ampdac: playing, client $client_name${client_pid:+ pid $client_pid}"
+            playing="${playing:+$playing; }ampdac, client $client_name"
+        else
+            echo "ampdac: playing, a client holds the socket"
+            playing="${playing:+$playing; }ampdac"
+        fi
+        echo "kernel card is closed: the DAC is open in ampdacd"
+    fi
+    local sock=/run/ampdac.sock
+    local sock_unit svc_unit
+    sock_unit=$(systemctl is-active ampdac.socket 2>/dev/null || true)
+    svc_unit=$(systemctl is-active ampdac.service 2>/dev/null || true)
+    echo "ampdac.socket: ${sock_unit:-unknown}"
+    echo "ampdac.service: ${svc_unit:-unknown}"
+    if [ -S "$sock" ]; then
+        ls -l "$sock"
+    else
+        echo "socket $sock is missing"
+    fi
+
+    if volumio_here; then
+    echo
+    echo "=== route and web label ==="
+    # asound.conf, the Volumio config and mpd.conf are often mode 600.
+    # A direct sudo cat asks for a password; ampdac-asound report is the
+    # NOPASSWD command that reads them.
+    if [ "$got_report" -eq 0 ]; then
+        if [ -x /usr/local/sbin/ampdac-asound ]; then
+            echo "sudo report unavailable, reading files directly"
+        fi
+        if [ -f "$asound" ] && [ ! -r "$asound" ]; then
+            sudo -n /usr/local/sbin/ampdac-asound relax >/dev/null 2>&1 || true
+        fi
+        if [ -r "$asound" ]; then
+            if grep -q 'ampdac-route' "$asound" || grep -q 'slave.pcm[[:space:]]*"ampdac"' "$asound"; then
+                route="ampdac"
+            else
+                route_card=$(awk '
+                    {
+                        p = index($0, "card \"")
+                        if (p == 0) next
+                        line = substr($0, p + 6)
+                        q = index(line, "\"")
+                        if (q > 1) print substr(line, 1, q - 1)
+                    }
+                ' "$asound" | head -1)
+                route="kernel"
+            fi
+        elif [ -f "$asound" ]; then
+            route="unreadable"
+        else
+            route="missing"
+        fi
+        if [ -r "$vconf" ]; then
+            web_state=ok
+            web_name=$(json_value "$vconf" outputdevicename)
+            web_id=$(json_value "$vconf" outputdevice)
+            web_card=$(json_value "$vconf" outputdevicecardname)
+        elif [ -f "$vconf" ]; then
+            web_state=unreadable
+        else
+            web_state=missing
+        fi
+        load_mpd "$mpd"
+    fi
+
+    case "$route" in
+        ampdac)
+            echo "PCM volumio opens: ampdac"
+            ;;
+        kernel)
+            echo "PCM volumio opens: kernel card${route_card:+ \"$route_card\"}"
+            ;;
+        unreadable)
+            echo "PCM volumio: $asound exists but is not readable"
+            ;;
+        missing)
+            echo "PCM volumio: $asound is missing (not Volumio, or the route is not written yet)"
+            ;;
+        *)
+            echo "PCM volumio: route was not read"
+            ;;
+    esac
+
+    case "$web_state" in
+        ok)
+            echo "Volumio shows: ${web_name:-unread}  (id ${web_id:-unread}, card ${web_card:-unread})"
+            if [ "$web_id" = "ampdac" ] || [ "$web_card" = "ampdac" ]; then
+                if [ "$route" = "ampdac" ]; then
+                    echo "match: web and route are both ampdac"
+                elif [ "$route" = "unreadable" ]; then
+                    echo "web is ampdac, route file was not read"
+                else
+                    echo "mismatch: web is ampdac, sound goes to ${route}${route_card:+ $route_card}"
+                fi
+            fi
+            ;;
+        unreadable)
+            echo "Volumio: $vconf exists but is not readable"
+            ;;
+    esac
+    if [ -n "$web_snip" ] && [ -z "$web_name$web_id$web_card" ]; then
+        echo "config snippet: $web_snip"
+    fi
+
+    if [ -f /var/lib/ampdac.route ]; then
+        echo "route flag: on (/var/lib/ampdac.route)"
+    else
+        echo "route flag: off"
+    fi
+    fi
+
+    if [ -z "$mpd_rows" ] && [ -z "$mpd_state" ]; then
+        load_mpd "$mpd"
+    fi
+
+    echo
+    echo "=== kernel cards ==="
+    local cards_out=""
+    if [ -r "$cards_file" ]; then
+        cards_out=$(awk '
+            function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+            /^[ \t]*[0-9]+[ \t]+\[/ {
+                line = $0
+                num = $1
+                id = ""
+                desc = line
+                if (match(line, /\[[^]]+\]/)) {
+                    id = trim(substr(line, RSTART + 1, RLENGTH - 2))
+                }
+                p = index(desc, "]:")
+                if (p > 0) desc = substr(desc, p + 2)
+                sub(/^[ \t]+/, "", desc)
+                sub(/^[^ ]* - /, "", desc)
+                printf "  card %s  [%s]  %s\n", num, id, desc
+            }
+        ' "$cards_file")
+    fi
+    if [ -z "$cards_out" ] && command -v aplay >/dev/null 2>&1; then
+        cards_out=$(aplay -l 2>/dev/null | awk '
+            /^card [0-9]+:/ {
+                line = $0
+                sub(/^card /, "  card ", line)
+                print line
+            }
+        ')
+    fi
+    if [ -n "$cards_out" ]; then
+        printf '%s\n' "$cards_out"
+    else
+        echo "  no hardware cards"
+    fi
+
+    echo
+    echo "=== PCM ampdac ==="
+    if command -v aplay >/dev/null 2>&1 && aplay -L 2>/dev/null | grep -q '^ampdac$'; then
+        echo "  ampdac is in aplay -L"
+    elif [ -f /usr/share/alsa/alsa.conf.d/50-ampdac.conf ] || [ -f /etc/alsa/conf.d/50-ampdac.conf ]; then
+        echo "  pcm.ampdac is installed, aplay -L did not list it"
+    else
+        echo "  pcm.ampdac is not installed"
+    fi
+
+    local show_mpd=0
+    if volumio_here; then
+        show_mpd=1
+    elif [ -n "$mpd_rows" ] || { [ -n "$mpd_state" ] && [ "$mpd_state" != "missing" ]; }; then
+        show_mpd=1
+    fi
+    if [ "$show_mpd" -eq 1 ]; then
+    echo
+    echo "=== MPD outputs ==="
+    if [ "$mpd_warn" = "undefined" ]; then
+        echo "  $mpd has an undefined line: MPD will not start, so there is no sound"
+    fi
+    if [ -n "$mpd_rows" ]; then
+        local row name device enabled dop extra
+        while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            IFS='|' read -r name device enabled dop <<<"$row"
+            extra=""
+            if [ -n "$dop" ]; then
+                extra="  dop $dop"
+            fi
+            printf '  %-16s device %-12s enabled %s%s\n' \
+                "${name:-?}" "${device:--}" "${enabled:-yes}" "$extra"
+        done <<<"$mpd_rows"
+    elif [ "$mpd_state" = "unreadable" ]; then
+        echo "  $mpd exists but is not readable"
+    elif [ "$mpd_state" = "missing" ]; then
+        echo "  $mpd is missing"
+    else
+        if [ -n "$mpd_bytes" ]; then
+            echo "  $mpd has no audio_output blocks (bytes $mpd_bytes, audio_output lines: ${mpd_hits:-0})"
+        else
+            echo "  $mpd has no audio_output blocks"
+        fi
+    fi
+    fi
+
+    echo
+    if [ "$client_open" -eq 1 ]; then
+        if [ -n "$client_name" ] && [ "$client_name" != "open" ]; then
+            echo "summary: playing ampdac, client $client_name${client_pid:+ pid $client_pid}"
+        else
+            echo "summary: playing ampdac"
+        fi
+    elif [ -n "$playing" ]; then
+        echo "summary: playing $playing"
+    elif [ -n "$daemon" ]; then
+        echo "summary: nothing is playing, ampdacd is waiting"
+    else
+        echo "summary: nothing is playing"
+    fi
+}
+
+kernel_card() {
+    local st card id
+    for st in /proc/asound/card*/pcm*p/sub*/status; do
+        [ -f "$st" ] || continue
+        grep -q '^state:[[:space:]]*RUNNING' "$st" || continue
+        card=$(echo "$st" | sed -n 's#/proc/asound/card\([0-9]*\)/.*#\1#p')
+        id=""
+        if [ -r /proc/asound/cards ]; then
+            id=$(awk -v n="$card" '
+                function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+                $1 == n {
+                    if (match($0, /\[[^]]+\]/)) {
+                        print trim(substr($0, RSTART + 1, RLENGTH - 2))
+                    }
+                    exit
+                }
+            ' /proc/asound/cards)
+        fi
+        echo "${id:-$card}"
+        return 0
+    done
+    return 1
+}
+
+cmd_transport() {
+    local route="" route_card="" report="" line kind a b client_name="" client_pid=""
+    local asound=/etc/asound.conf
+    if [ -x /usr/local/sbin/ampdac-asound ]; then
+        if report="$(sudo -n /usr/local/sbin/ampdac-asound report 2>/dev/null)" \
+            && printf '%s\n' "$report" | grep -q '^route|'; then
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                IFS='|' read -r kind a b _ <<<"$line"
+                case "$kind" in
+                    route)
+                        route="$a"
+                        route_card="$b"
+                        ;;
+                    client)
+                        client_name="$a"
+                        client_pid="$b"
+                        ;;
+            esac
+        done <<<"$report"
+        fi
+    fi
+    if [ -z "$client_name" ] || [ "$client_name" = "open" ]; then
+        detect_client
+    fi
+    if [ -z "$route" ] && [ -r "$asound" ]; then
+        if grep -q 'ampdac-route' "$asound" || grep -q 'slave.pcm[[:space:]]*"ampdac"' "$asound"; then
+            route="ampdac"
+        else
+            route="kernel"
+        fi
+    fi
+
+    if [ ! -S /run/ampdac.sock ]; then
+        echo "ampdacd is not running"
+        note_bypass
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is missing, cannot query ampdacd"
+        return 1
+    fi
+
+    local text rc=0
+    text="$(python3 - << 'PY'
+import socket, struct, sys
+path = "/run/ampdac.sock"
+hdr = struct.pack("<IHHiI", 0x44504D41, 1, 10, 0, 0)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(8.0)
+try:
+    s.connect(path)
+    s.sendall(hdr)
+    buf = b""
+    while len(buf) < 16:
+        chunk = s.recv(16 - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    if len(buf) != 16:
+        sys.exit(1)
+    magic, ver, typ, status, length = struct.unpack("<IHHiI", buf)
+    body = b""
+    while len(body) < length:
+        chunk = s.recv(length - len(body))
+        if not chunk:
+            break
+        body += chunk
+except OSError:
+    sys.exit(1)
+if status == 0:
+    sys.stdout.buffer.write(body)
+    sys.exit(0)
+if status == -10:
+    sys.exit(2)
+sys.exit(1)
+PY
+)" || rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        local client_line=""
+        if [ -n "$client_name" ] && [ "$client_name" != "open" ]; then
+            client_line="client: $client_name${client_pid:+ pid $client_pid}"
+        fi
+        if [ -n "$client_line" ]; then
+            printf '%s\n' "$text" | awk -v c="$client_line" '
+                $0 == "transport: playing" && !done { print c; done = 1 }
+                { print }
+            '
+        else
+            printf '%s' "$text"
+            case "$text" in
+                *$'\n') ;;
+                *) echo ;;
+            esac
+        fi
+        case "$text" in
+            *"transport: playing"*) return 0 ;;
+        esac
+        note_bypass
+        return 0
+    fi
+    if [ "$rc" -eq 2 ]; then
+        echo "playback: idle"
+    else
+        echo "ampdacd did not answer"
+    fi
+    note_bypass
+    return 0
+}
+
+case "${1:-}" in
+    show)
+        case "${2:-}" in
+            status) cmd_status ;;
+            transport) cmd_transport ;;
+            *) usage; exit 1 ;;
+        esac
+        ;;
+    status)
+        cmd_status
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
+exit 0

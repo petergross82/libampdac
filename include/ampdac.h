@@ -52,6 +52,8 @@ typedef enum ampdac_pcm_format {
     AMPDAC_PCM_S16LE = 0,
     AMPDAC_PCM_S32LE = 1,
     AMPDAC_PCM_F32LE = 2,
+    /** Packed 24-bit little-endian. Widened to a 4-byte MSB-aligned subslot. */
+    AMPDAC_PCM_S24_3LE = 3,
 } ampdac_pcm_format;
 
 typedef struct ampdac_device_info {
@@ -187,6 +189,12 @@ ampdac_status ampdac_negotiated_format(const ampdac_session *session,
 
 ampdac_status ampdac_start(ampdac_session *session);
 
+/**
+ * Discard audio queued for the DAC and keep the USB stream running.
+ * The next samples are played from silence; the interface is not released.
+ */
+ampdac_status ampdac_drop(ampdac_session *session);
+
 typedef struct ampdac_stream_stats {
     uint64_t underrun_count;
     /** 0 until the first valid explicit-feedback IN packet. */
@@ -202,9 +210,9 @@ ampdac_status ampdac_get_stats(const ampdac_session *session,
  * Push interleaved samples for the configured session.
  * PCM: host decoder bytes in the format given to ampdac_configure_pcm.
  * DSD: interleaved MSBF DSD bytes (FFmpeg dsd_msbf / u8), no volume.
- * Blocks while the ring is full (500 µs poll), up to ~2 s since the last
- * successful push. A full ring does not return a short count: the call waits,
- * then returns AMPDAC_ERR_TIMEOUT. ISO transfers start after the ring is half
+ * Blocks while the ring is full (500 µs poll). The whole call gives up
+ * after ~2 s and returns AMPDAC_ERR_TIMEOUT; it does not return a short
+ * count for back-pressure. ISO transfers start after the ring is half
  * full. A trailing partial sample that does not fill a frame is left
  * unconsumed and the return value is that shorter count.
  * @return bytes consumed from input, or a negative ampdac_status.

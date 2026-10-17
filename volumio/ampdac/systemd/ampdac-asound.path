@@ -1,0 +1,8 @@
+[Unit]
+Description=Re-apply the ampdac route when Volumio rewrites asound.conf
+
+[Path]
+PathChanged=/etc/asound.conf
+
+[Install]
+WantedBy=multi-user.target

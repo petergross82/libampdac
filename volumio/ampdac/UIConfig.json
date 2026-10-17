@@ -4,8 +4,8 @@
     {
       "id": "about",
       "element": "section",
-      "label": "UAC2 userspace output",
-      "description": "MPD plays to the ALSA device ampdac. Resampling stays off. Volume on this path is unity; use the DAC control. The daemon is ampdacd.",
+      "label": "Выход на USB ЦАП",
+      "description": "После включения в параметрах воспроизведения, рядом с картой ядра (FiiO и другими), появляется «ampdac USB DAC». Пока выбрана карта ядра, звук идёт как раньше. Выберите «ampdac USB DAC», чтобы MPD открывал тот же PCM volumio, но уже без передискретизации, через ampdacd. Громкость этого пути — на самом ЦАПе.",
       "icon": "fa fa-volume-up",
       "content": []
     }

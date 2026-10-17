@@ -27,6 +27,7 @@ add_library(ampdac SHARED
     ${ANDROID_NATIVE}/uac2_descriptor_parser.cpp
     ${ANDROID_NATIVE}/uac2_dsd_detector.cpp
     ${ANDROID_NATIVE}/uac2_clock_control.cpp
+    ${ANDROID_NATIVE}/uac2_feature_volume.cpp
     ${ANDROID_NATIVE}/usb_device_controller.cpp
     ${ANDROID_NATIVE}/usb_iso_transfer_pool.cpp
     ${ANDROID_NATIVE}/spsc_ring_buffer.cpp
@@ -114,3 +115,4 @@ install(FILES udev/99-ampdac.rules DESTINATION lib/udev/rules.d)
 install(FILES alsa/50-ampdac.conf DESTINATION share/alsa/alsa.conf.d)
 install(FILES systemd/ampdac.service systemd/ampdac.socket DESTINATION lib/systemd/system)
 install(FILES wireplumber/50-ampdac.conf DESTINATION share/wireplumber/wireplumber.conf.d)
+install(PROGRAMS volumio/ampdac/ampdac DESTINATION bin)

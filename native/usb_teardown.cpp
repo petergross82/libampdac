@@ -32,6 +32,7 @@
 #include "usb_driver_context.h"
 #include "usb_device_controller.h"
 #include "uac2_clock_control.h"
+#include "uac2_feature_volume.h"
 
 #include <android/log.h>
 #include <chrono>
@@ -325,6 +326,10 @@ void teardown_context(UsbDriverContext *ctx) noexcept
     TDLOGI("teardown_context: BEGIN  fd=%d  device_handle=%p",
            ctx->device_fd,
            static_cast<void *>(ctx->device_handle));
+
+    // Buttons keep their own HID handle. Drop the session handle before
+    // soft-reset and close so a volume write cannot land on it.
+    uac2_volume_service_detach();
 
     (void)ctx->playback_state.transition_to(UsbPlaybackState::Stopping);
     if (ctx->producer_coordinator) {
@@ -690,6 +695,7 @@ void teardown_context(UsbDriverContext *ctx) noexcept
             TDLOGD("teardown_context Phase 7b: skipped ctrl release "
                    "(ctrl_interface_number == -1, never claimed)");
         }
+        uac2_volume_service_ac_free();
 
         // ── Phase 8: Close the device handle ─────────────────────────────────
         // libusb_close() decrements libusb's internal reference count on the

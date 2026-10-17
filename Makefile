@@ -18,6 +18,7 @@ SRCS := \
 	$(NATIVE)/uac2_descriptor_parser.cpp \
 	$(NATIVE)/uac2_dsd_detector.cpp \
 	$(NATIVE)/uac2_clock_control.cpp \
+	$(NATIVE)/uac2_feature_volume.cpp \
 	$(NATIVE)/usb_device_controller.cpp \
 	$(NATIVE)/usb_iso_transfer_pool.cpp \
 	$(NATIVE)/spsc_ring_buffer.cpp \

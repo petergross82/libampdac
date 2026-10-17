@@ -14,9 +14,9 @@
 struct UsbDriverContext;
 
 /// Ring buffer capacity (bytes) created by usb_transport_prepare().
-/// 192 kHz / 32-bit stereo = 1 536 B per 1 ms transfer × 16 ms pool × 3× headroom
-/// → 73 728 B → next power of two = 131 072 B (128 KB ≈ 43 ms of audio).
-inline constexpr std::size_t kDefaultRingBufferBytes = 128UL * 1024UL;
+/// The ALSA device may queue up to 256 KB. The ring has to be larger than
+/// that queue or a track start blocks inside the player's output lock.
+inline constexpr std::size_t kDefaultRingBufferBytes = 512UL * 1024UL;
 
 /**
  * Prepares the isochronous transport for a playback session:

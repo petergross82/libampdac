@@ -196,6 +196,10 @@ ampdac_status ampdac_client_start(ampdac_client *client) {
     return rpc_empty(client, AMPDAC_IPC_START, NULL, 0, NULL, 0, NULL);
 }
 
+ampdac_status ampdac_client_drop(ampdac_client *client) {
+    return rpc_empty(client, AMPDAC_IPC_DROP, NULL, 0, NULL, 0, NULL);
+}
+
 int ampdac_client_write(ampdac_client *client, const void *pcm, size_t bytes) {
     if (client == NULL || client->fd < 0 || pcm == NULL) {
         set_client_error("ampdac_client_write: invalid arguments");

@@ -9,8 +9,10 @@
  *
  * UAC2 distinguishes the physical subslot width from the number of meaningful
  * sample bits. For example, a DAC may advertise 24 valid bits in a four-byte
- * subslot. Keeping both values together prevents producers from inventing a
- * wire layout from the source file's bit depth.
+ * subslot. A three-byte subslot is the packed 24-bit fallback used only when
+ * the DAC has no four-byte PCM alternate. Keeping both values together
+ * prevents producers from inventing a wire layout from the source file's bit
+ * depth.
  */
 struct UsbPcmWireFormat {
     uint32_t sample_rate_hz = 0;
@@ -24,11 +26,11 @@ struct UsbPcmWireFormat {
      */
     [[nodiscard]] constexpr bool is_valid() const noexcept
     {
+        const bool slot4 = subslot_bytes == 4 && valid_bits > 0 && valid_bits <= 32;
+        const bool slot3 = subslot_bytes == 3 && valid_bits > 0 && valid_bits <= 24;
         return sample_rate_hz > 0 &&
                channel_count > 0 &&
-               subslot_bytes == 4 &&
-               valid_bits > 0 &&
-               valid_bits <= 32;
+               (slot4 || slot3);
     }
 
     /**

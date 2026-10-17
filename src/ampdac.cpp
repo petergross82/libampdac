@@ -22,6 +22,7 @@
 #include "native_dsd_formatter.h"
 #include "pcm_wire_formatter.h"
 #include "uac2_clock_control.h"
+#include "uac2_feature_volume.h"
 #include "uac2_descriptor_parser.h"
 #include "uac2_dsd_detector.h"
 #include "usb_device_controller.h"
@@ -115,14 +116,134 @@ bool has_audio_in_flight(const IsoTransferPool &pool) noexcept {
     return false;
 }
 
+bool wire_is_zero(const uint8_t *p, std::size_t n) noexcept {
+    if (p == nullptr) return true;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (p[i] != 0) return false;
+    }
+    return true;
+}
+
+/** Byte offset of the first 8-frame DoP run, or n if there is none. */
+std::size_t dop_payload_offset(const uint8_t *p, std::size_t n) noexcept {
+    if (p == nullptr || n < 64U) return n;
+    for (std::size_t base = 0; base + 64U <= n; base += 8U) {
+        uint8_t marker = p[base + 3U];
+        if (marker != kDopMarkerA && marker != kDopMarkerB) continue;
+        bool ok = true;
+        for (std::size_t i = 0; i < 8U; ++i) {
+            const std::size_t off = base + i * 8U;
+            if (p[off + 3U] != marker || p[off + 7U] != marker) {
+                ok = false;
+                break;
+            }
+            marker = static_cast<uint8_t>(marker ^ kDopToggleMask);
+        }
+        if (ok) return base;
+    }
+    return n;
+}
+
+void apply_pcm_fade_in(uint8_t *wire, std::size_t bytes, int channels,
+                       int bytes_per_sample, int &left, int total) noexcept {
+    if (bytes_per_sample != 4) {
+        left = 0;
+        return;
+    }
+    if (wire == nullptr || left <= 0 || total <= 0 || channels <= 0) return;
+    const std::size_t bpf = static_cast<std::size_t>(channels) * 4U;
+    if (bytes < bpf) return;
+    const std::size_t frames = bytes / bpf;
+    for (std::size_t frame = 0; frame < frames && left > 0; ++frame) {
+        const int done = total - left;
+        for (int ch = 0; ch < channels; ++ch) {
+            int32_t sample = 0;
+            uint8_t *const p = wire + frame * bpf + static_cast<std::size_t>(ch) * 4U;
+            std::memcpy(&sample, p, 4);
+            sample = static_cast<int32_t>(
+                    (static_cast<int64_t>(sample) * done) / total);
+            std::memcpy(p, &sample, 4);
+        }
+        --left;
+    }
+}
+
 PcmSourceEncoding source_encoding(ampdac_pcm_format format) {
     switch (format) {
         case AMPDAC_PCM_S16LE: return PcmSourceEncoding::S16Le;
+        case AMPDAC_PCM_S24_3LE: return PcmSourceEncoding::S24_3Le;
         case AMPDAC_PCM_S32LE:
         case AMPDAC_PCM_F32LE:
         default:
             return PcmSourceEncoding::S32Le;
     }
+}
+
+/**
+ * SMSL advertises two 4-byte PCM alts: bBitResolution 32 and 24. 24-bit audio
+ * with a zero padding byte on the 32-bit alt is what clicks; the 24-bit alt
+ * is the one that knows those low bits are padding.
+ */
+const Uac2StreamingEndpointInfo *prefer_pcm_bit_resolution(
+        const std::vector<Uac2StreamingEndpointInfo> &candidates,
+        uint8_t bit_resolution,
+        int channel_count,
+        int sample_rate_hz) {
+    const uint32_t frames =
+            (static_cast<uint32_t>(sample_rate_hz) + 7999U) / 8000U;
+    const uint32_t need = frames * 4U * static_cast<uint32_t>(channel_count);
+    const Uac2StreamingEndpointInfo *best = nullptr;
+    for (const auto &candidate : candidates) {
+        const auto &as = candidate.as_general;
+        if (!as.is_present || as.format_type != UAC2_FORMAT_TYPE_I) continue;
+        if ((as.bm_formats & UAC_FORMAT_TYPE_I_PCM) == 0U) continue;
+        if (as.subslot_size != 4U || as.bit_resolution != bit_resolution) continue;
+        if (as.nr_channels != 0U &&
+            as.nr_channels != static_cast<uint8_t>(channel_count)) {
+            continue;
+        }
+        if (candidate.effective_bytes_per_uframe < need) continue;
+        if (best == nullptr || candidate.alt_setting < best->alt_setting) {
+            best = &candidate;
+        }
+    }
+    return best;
+}
+
+/**
+ * Last resort: a DAC whose only PCM alternate is a packed 3-byte slot.
+ * Four-byte selection has already failed for this rate and channel count.
+ * DoP never comes here; it stays on a 4-byte slot.
+ */
+const Uac2StreamingEndpointInfo *prefer_packed_pcm24(
+        const std::vector<Uac2StreamingEndpointInfo> &candidates,
+        int channel_count,
+        int sample_rate_hz) {
+    const uint32_t frames =
+            (static_cast<uint32_t>(sample_rate_hz) + 7999U) / 8000U;
+    const uint32_t need = frames * 3U * static_cast<uint32_t>(channel_count);
+    const Uac2StreamingEndpointInfo *best = nullptr;
+    for (const auto &candidate : candidates) {
+        const auto &as = candidate.as_general;
+        if (!as.is_present || as.format_type != UAC2_FORMAT_TYPE_I) continue;
+        if ((as.bm_formats & UAC_FORMAT_TYPE_I_PCM) == 0U) continue;
+        if (as.subslot_size != 3U || as.bit_resolution > 24U) continue;
+        if (as.nr_channels != 0U &&
+            as.nr_channels != static_cast<uint8_t>(channel_count)) {
+            continue;
+        }
+        if (candidate.effective_bytes_per_uframe < need) continue;
+        const int rank = (as.bit_resolution == 24U || as.bit_resolution == 0U) ? 0 : 1;
+        const int best_rank = best == nullptr
+                ? 2
+                : ((best->as_general.bit_resolution == 24U ||
+                    best->as_general.bit_resolution == 0U) ? 0 : 1);
+        if (best == nullptr || rank < best_rank ||
+            (rank == best_rank && candidate.alt_setting < best->alt_setting)) {
+            best = &candidate;
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -138,6 +259,10 @@ struct ampdac_session {
     bool dsd = false;
     bool native_dsd = false;
     uint8_t dop_marker = kDopMarkerA;
+    int pcm_fade_in_left = 0;
+    int pcm_fade_in_total = 0;
+    bool dop_lead_sent = false;
+    uint32_t skipped_silence_bytes = 0;
     std::vector<uint8_t> dsd_carry;
     AmpdacKernelClaim kernel{};
 };
@@ -178,12 +303,31 @@ uint32_t canonicalize_dsd_rate_hz(uint32_t rate_hz) {
     return 0;
 }
 
+struct VolumeAcLease {
+    bool yielded = false;
+    VolumeAcLease() {
+        uac2_volume_service_start();
+        uac2_volume_service_yield_ac();
+        yielded = true;
+    }
+    void attached(libusb_device_handle *handle, int ac_interface) {
+        uac2_volume_service_attach(handle, ac_interface);
+        yielded = false;
+    }
+    ~VolumeAcLease() {
+        if (yielded) {
+            uac2_volume_service_ac_free();
+        }
+    }
+};
+
 ampdac_status program_usb_stream(
         ampdac_session *session,
         uint32_t usb_clock_hz,
         uint32_t bytes_per_frame,
         bool settle_pll) {
     UsbDriverContext *ctx = session->ctx;
+    VolumeAcLease volume_ac;
 
     std::string retry_error;
     (void)ampdac_kernel_takeover(ctx->device_handle, &session->kernel, &retry_error);
@@ -236,6 +380,7 @@ ampdac_status program_usb_stream(
                 &winning_clock_id);
         if (clock_rc == 4) {
             ctx->resolved_clock_source_id = static_cast<uint8_t>(winning_clock_id);
+            ctx->ctrl_interface_number = ctrl_iface;
         }
         return clock_rc;
     };
@@ -268,10 +413,6 @@ ampdac_status program_usb_stream(
         return AMPDAC_ERR_CLOCK;
     }
 
-    if (settle_pll) {
-        usleep(kDsdPllSettleUs);
-    }
-
     const UsbControlStatus alt = uac2_apply_alt_setting(
             ctx->device_handle,
             session->endpoint.interface_number,
@@ -282,6 +423,28 @@ ampdac_status program_usb_stream(
         return AMPDAC_ERR_IO;
     }
     ctx->active_alt_setting = session->endpoint.alt_setting;
+
+    /* XMOS/FiiO drops a clock programmed at alt 0 when the streaming alt
+     * comes up. The PLL then stays at the power-on rate while we send
+     * 352.8 kHz, and the mismatch is a continuous crackle. Write the rate
+     * again now that the alt which will actually stream is active. */
+    if (ctx->resolved_clock_source_id != 0U && ctx->ctrl_interface_number >= 0) {
+        int winning_clock_id = 0;
+        const int locked = uac2_force_clock_sample_rate(
+                ctx->device_handle,
+                static_cast<uint8_t>(ctx->ctrl_interface_number),
+                ctx->resolved_clock_source_id,
+                usb_clock_hz,
+                &winning_clock_id);
+        if (locked != 4) {
+            set_error("UAC2 SET_CUR clock sample rate failed after alt-setting");
+            return AMPDAC_ERR_CLOCK;
+        }
+        ctx->resolved_clock_source_id = static_cast<uint8_t>(winning_clock_id);
+    }
+    if (settle_pll) {
+        usleep(kDsdPllSettleUs);
+    }
 
     IsoTransferPoolConfig pool_cfg;
     pool_cfg.sample_rate_hz = usb_clock_hz;
@@ -294,6 +457,7 @@ ampdac_status program_usb_stream(
     pool_cfg.feedback_interval = session->endpoint.feedback_interval != 0U
             ? session->endpoint.feedback_interval
             : static_cast<uint8_t>(4);
+    pool_cfg.max_packet_bytes = session->endpoint.effective_bytes_per_uframe;
 
     std::string pool_error;
     ctx->transfer_pool = IsoTransferPool::create(
@@ -303,6 +467,9 @@ ampdac_status program_usb_stream(
         return AMPDAC_ERR_IO;
     }
     ctx->iso_endpoint_address = pool_cfg.endpoint_address;
+    if (ctx->ctrl_interface_number >= 0) {
+        volume_ac.attached(ctx->device_handle, ctx->ctrl_interface_number);
+    }
     return AMPDAC_OK;
 }
 
@@ -312,16 +479,16 @@ int push_wire_with_prefill(
         std::size_t wire_bytes,
         bool *transfers_started,
         UsbPlaybackState live_state) {
-    auto deadline = std::chrono::steady_clock::now() +
+    const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(kWriteTimeoutMs);
     std::size_t chunk_offset = 0;
     while (chunk_offset < wire_bytes) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            set_error("ring buffer back-pressure timeout");
+            return AMPDAC_ERR_TIMEOUT;
+        }
         const std::size_t free_bytes = session->ctx->ring_buffer->free_space();
         if (free_bytes == 0U) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                set_error("ring buffer back-pressure timeout");
-                return AMPDAC_ERR_TIMEOUT;
-            }
             usleep(kWritePollUs);
             continue;
         }
@@ -332,8 +499,6 @@ int push_wire_with_prefill(
             continue;
         }
         chunk_offset += push_bytes;
-        deadline = std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(kWriteTimeoutMs);
 
         if (!*transfers_started) {
             const std::size_t prefill_goal =
@@ -582,13 +747,32 @@ extern "C" ampdac_status ampdac_configure_pcm(
         return AMPDAC_ERR_UNSUPPORTED;
     }
 
-    // PcmWireFormatter requires a 4-byte Type-I subslot (Android contract).
-    const Uac2StreamingEndpointInfo *selected = uac2_select_endpoint_for_format(
+    // The normal path is a 4-byte Type-I subslot. 24-bit PCM uses the alt
+    // that advertises 24 valid bits. The 32-bit alt plays the zero padding
+    // byte as audio, and that is the click. DoP carrier rates stay on the
+    // 32-bit alt: that is the layout SMSL already locks to DSD on, and the
+    // marker still sits in the top byte. A packed 3-byte alt is used only
+    // when no 4-byte PCM alt matches this rate and channel count.
+    const bool dop_carrier =
+            config->sample_rate_hz == 176400U ||
+            config->sample_rate_hz == 352800U ||
+            config->sample_rate_hz == 705600U;
+    const Uac2StreamingEndpointInfo *selected = nullptr;
+    if (config->format == AMPDAC_PCM_S24_3LE && !dop_carrier) {
+        selected = prefer_pcm_bit_resolution(
+                candidates,
+                24,
+                static_cast<int>(config->channels),
+                static_cast<int>(config->sample_rate_hz));
+    }
+    if (selected == nullptr) {
+        selected = uac2_select_endpoint_for_format(
             candidates,
             32,
             static_cast<int>(config->channels),
             static_cast<int>(config->sample_rate_hz),
             true);
+    }
     if (selected == nullptr) {
         selected = uac2_select_endpoint_for_format(
                 candidates,
@@ -597,25 +781,31 @@ extern "C" ampdac_status ampdac_configure_pcm(
                 static_cast<int>(config->sample_rate_hz),
                 false);
     }
-    if (selected == nullptr) {
-        set_error("no matching UAC2 endpoint for requested PCM format");
-        return AMPDAC_ERR_UNSUPPORTED;
+    if (selected == nullptr || selected->as_general.subslot_size != 4U) {
+        selected = prefer_packed_pcm24(
+                candidates,
+                static_cast<int>(config->channels),
+                static_cast<int>(config->sample_rate_hz));
     }
-    if (selected->as_general.subslot_size != 4U) {
-        set_error("DAC alternate setting is not a 4-byte PCM subslot");
+    if (selected == nullptr ||
+        (selected->as_general.subslot_size != 4U &&
+         selected->as_general.subslot_size != 3U)) {
+        set_error("no matching UAC2 endpoint for requested PCM format");
         return AMPDAC_ERR_UNSUPPORTED;
     }
 
     session->endpoint = *selected;
-    const uint8_t valid_bits =
+    const uint8_t subslot = selected->as_general.subslot_size;
+    uint8_t valid_bits =
             selected->as_general.bit_resolution > 0U
                 ? selected->as_general.bit_resolution
-                : static_cast<uint8_t>(32);
+                : static_cast<uint8_t>(subslot == 3U ? 24 : 32);
+    if (subslot == 3U && valid_bits > 24U) valid_bits = 24;
     ctx->pcm_valid_bit_depth = valid_bits;
     ctx->pcm_wire_format = UsbPcmWireFormat{
             config->sample_rate_hz,
             config->channels,
-            selected->as_general.subslot_size,
+            subslot,
             valid_bits,
     };
     if (!ctx->pcm_wire_format.is_valid()) {
@@ -627,13 +817,17 @@ extern "C" ampdac_status ampdac_configure_pcm(
     const ampdac_status usb_st = program_usb_stream(
             session,
             config->sample_rate_hz,
-            static_cast<uint32_t>(config->channels) * 4U,
-            false);
+            static_cast<uint32_t>(config->channels) * subslot,
+            true);
     if (usb_st != AMPDAC_OK) return usb_st;
 
     session->format = config->format;
     session->volume.store(config->volume, std::memory_order_relaxed);
     session->dsd = false;
+    session->pcm_fade_in_left = 0;
+    session->pcm_fade_in_total = 0;
+    session->dop_lead_sent = false;
+    session->skipped_silence_bytes = 0;
     session->native_dsd = false;
     ctx->was_dsd_session = false;
     ctx->dsd_wire_mode = DsdWireMode::Native;
@@ -751,6 +945,10 @@ extern "C" ampdac_status ampdac_configure_dsd(
     session->dsd = true;
     session->native_dsd = native;
     session->dop_marker = kDopMarkerA;
+    session->pcm_fade_in_left = 0;
+    session->pcm_fade_in_total = 0;
+    session->dop_lead_sent = false;
+    session->skipped_silence_bytes = 0;
     session->dsd_carry.clear();
     session->volume.store(1.0f, std::memory_order_relaxed);
     ctx->was_dsd_session = true;
@@ -817,6 +1015,58 @@ extern "C" ampdac_status ampdac_start(ampdac_session *session) {
     }
     (void)session->ctx->playback_state.transition_to(UsbPlaybackState::Priming);
     session->started = true;
+    return AMPDAC_OK;
+}
+
+extern "C" ampdac_status ampdac_drop(ampdac_session *session) {
+    if (session == nullptr || session->ctx == nullptr) {
+        set_error("ampdac_drop: invalid session");
+        return AMPDAC_ERR_INVALID;
+    }
+    session->dsd_carry.clear();
+    if (!session->started || session->ctx->ring_buffer == nullptr ||
+        session->ctx->transfer_pool == nullptr) {
+        return AMPDAC_OK;
+    }
+    /* PCM: the next USB buffers ramp the last sample to zero. A hard step
+     * to digital silence is the click at every track change.
+     * DoP rides inside PCM (DeaDBeeF ffmpeg). Ramping those samples
+     * clears the marker and the DAC leaves DSD. */
+    const bool dop_pcm = !session->dsd &&
+            session->ctx->transfer_pool->stream_is_dop();
+    if (!session->dsd && !dop_pcm) {
+        const uint32_t rate = session->ctx->pcm_wire_format.sample_rate_hz;
+        int frames = rate > 0U ? static_cast<int>(rate / 125U) : 352;
+        if (frames < 32) frames = 32;
+        if (frames > 8000) frames = 8000;
+        session->ctx->transfer_pool->request_pcm_fade(frames);
+        session->pcm_fade_in_left = frames;
+        session->pcm_fade_in_total = frames;
+    }
+    /* New completions play silence or the ramp. A callback that already
+     * took the ring pointer finishes its pop before the indices are cleared. */
+    session->ctx->transfer_pool->attach_ring_buffer(nullptr);
+    usleep(1000);
+    session->ctx->ring_buffer->reset();
+    if ((session->dsd && !session->native_dsd) || dop_pcm) {
+        /* Continue the marker the wire just used. A silence pattern that
+         * restarts at 0x05 while the stream was on 0xFA drops DoP lock. */
+        const uint8_t last = session->ctx->transfer_pool->last_dop_marker();
+        uint8_t marker = (last == kDopMarkerA || last == kDopMarkerB)
+                ? static_cast<uint8_t>(last ^ kDopToggleMask)
+                : session->dop_marker;
+        uint8_t block[64U * kDsdStereoWireBytes];
+        for (int i = 0; i < 4; ++i) {
+            marker = fill_dop_idle_stereo(block, 64U, marker);
+            (void)session->ctx->ring_buffer->push(block, sizeof(block));
+        }
+        session->dop_marker = marker;
+    } else if (session->native_dsd) {
+        uint8_t block[2048];
+        std::memset(block, kNativeDsdSilenceByte, sizeof(block));
+        (void)session->ctx->ring_buffer->push(block, sizeof(block));
+    }
+    session->ctx->transfer_pool->attach_ring_buffer(session->ctx->ring_buffer.get());
     return AMPDAC_OK;
 }
 
@@ -899,11 +1149,16 @@ extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t byt
     while (input_offset < bytes) {
         const std::size_t remaining = bytes - input_offset;
         std::size_t in_chunk = remaining;
+        const std::size_t slot = session->ctx->pcm_wire_format.subslot_bytes;
+        const std::size_t samples = slot > 0U ? wire_chunk.size() / slot : 0U;
         if (session->format == AMPDAC_PCM_S16LE) {
-            in_chunk = std::min(remaining, wire_chunk.size() / 2U);
+            in_chunk = std::min(remaining, samples * 2U);
             in_chunk -= in_chunk % 2U;
+        } else if (session->format == AMPDAC_PCM_S24_3LE) {
+            in_chunk = std::min(remaining, samples * 3U);
+            in_chunk -= in_chunk % 3U;
         } else {
-            in_chunk = std::min(remaining, wire_chunk.size());
+            in_chunk = std::min(remaining, samples * 4U);
             in_chunk -= in_chunk % 4U;
         }
         if (in_chunk == 0) break;
@@ -923,11 +1178,92 @@ extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t byt
             set_error("PCM wire formatter rejected chunk");
             return AMPDAC_ERR_FORMAT;
         }
+        if (session->pcm_fade_in_left > 0 &&
+            !session->ctx->transfer_pool->stream_is_dop()) {
+            apply_pcm_fade_in(wire_chunk.data(), formatted.bytes_written,
+                              session->ctx->pcm_wire_format.channel_count,
+                              session->ctx->pcm_wire_format.subslot_bytes,
+                              session->pcm_fade_in_left,
+                              session->pcm_fade_in_total);
+        }
 
+        /* DeaDBeeF writes a period of zeros before DoP is ready. Those zeros
+         * go out as PCM and the DAC sometimes never enters DSD. Hold them
+         * until real samples arrive, then start DoP from marked silence.
+         * Bytes before the first marker must not be queued: SMSL samples
+         * the format at the start of the stream and will not switch later. */
+        const uint8_t *payload = wire_chunk.data();
+        std::size_t payload_bytes = formatted.bytes_written;
+        if (!session->transfers_started) {
+            const auto &wire_fmt = session->ctx->pcm_wire_format;
+            const uint32_t bpf = static_cast<uint32_t>(wire_fmt.bytes_per_frame());
+            const uint32_t silence_cap = wire_fmt.sample_rate_hz > 0 && bpf > 0
+                    ? (wire_fmt.sample_rate_hz / 20U) * bpf
+                    : 0U;
+            const std::size_t dop_at = dop_payload_offset(
+                    wire_chunk.data(), formatted.bytes_written);
+            if (dop_at < formatted.bytes_written) {
+                session->ctx->transfer_pool->mark_stream_dop();
+                session->skipped_silence_bytes = 0;
+                if (!session->dop_lead_sent) {
+                    session->dop_lead_sent = true;
+                    /* 50 ms of marked silence before the music. SMSL decides
+                     * PCM vs DSD from the start of the stream and will not
+                     * switch later if that start was zeros. */
+                    int left = wire_fmt.sample_rate_hz > 0
+                            ? static_cast<int>(wire_fmt.sample_rate_hz / 20U)
+                            : 882;
+                    if (left < 128) left = 128;
+                    if (left > 8192) left = 8192;
+                    uint8_t marker = kDopMarkerA;
+                    uint8_t block[64U * kDsdStereoWireBytes];
+                    while (left > 0) {
+                        const int n = left > 64 ? 64 : left;
+                        marker = fill_dop_idle_stereo(
+                                block, static_cast<std::size_t>(n), marker);
+                        std::size_t off = 0;
+                        const std::size_t nbytes =
+                                static_cast<std::size_t>(n) * kDsdStereoWireBytes;
+                        while (off < nbytes) {
+                            const std::size_t free_bytes =
+                                    session->ctx->ring_buffer->free_space();
+                            if (free_bytes == 0U) {
+                                usleep(kWritePollUs);
+                                continue;
+                            }
+                            const std::size_t take = std::min(free_bytes, nbytes - off);
+                            if (!session->ctx->ring_buffer->push(block + off, take)) {
+                                usleep(kWritePollUs);
+                                continue;
+                            }
+                            off += take;
+                        }
+                        left -= n;
+                    }
+                    session->dop_marker = marker;
+                }
+                payload += dop_at;
+                payload_bytes -= dop_at;
+            } else if (wire_is_zero(wire_chunk.data(), formatted.bytes_written) &&
+                       silence_cap > 0U &&
+                       session->skipped_silence_bytes < silence_cap) {
+                session->skipped_silence_bytes +=
+                        static_cast<uint32_t>(formatted.bytes_written);
+                input_offset += in_chunk;
+                continue;
+            } else {
+                session->skipped_silence_bytes = 0;
+            }
+        }
+
+        if (payload_bytes == 0U) {
+            input_offset += in_chunk;
+            continue;
+        }
         const int pushed = push_wire_with_prefill(
                 session,
-                wire_chunk.data(),
-                formatted.bytes_written,
+                payload,
+                payload_bytes,
                 &transfers_started,
                 UsbPlaybackState::StreamingPcm);
         if (pushed < 0) return pushed;
