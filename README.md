@@ -30,6 +30,15 @@ is open and which alternates the DAC advertises. The ARM binaries inside the
 Volumio and moOde packages below were built before that text; a desktop build
 of this tree includes it.
 
+~~~
+$ ampdac show transport
+DAC: SMSL USB AUDIO (152a:85dd)
+...
+stream: PCM 44100 Hz, 24 bit, stereo
+alternate: 2 (24-bit PCM)  ← libampdac
+kernel would open: 1 (S32_LE, 32-bit)
+~~~
+
 ## What we measured
 
 These figures are from captures on the machines and DACs below. They are
@@ -47,9 +56,10 @@ The host did not use a smoothed or free-running clock in either case.
 The packet rhythm is not the same. The kernel submits 6 or 7 packets per
 URB and completions landed around 0.8 ms apart. libampdac submits 8 packets
 and completions landed around 1 ms apart. On a laptop with an Ice Lake
-controller the libampdac capture had no `ECOMM`. On a Raspberry Pi, `ECOMM`
-at the moment the SMSL interface was claimed came from the host controller,
-not from the feedback loop.
+controller the libampdac capture had no `ECOMM`. On a Raspberry Pi, ECOMM
+appeared in the first 1–2 seconds after the interface was claimed. On a
+laptop with an Ice Lake controller, the same capture had none. This points
+to the Pi's xHCI at stream open, not to the transport.
 
 Where a recording sounded different, the USB alternate was the split we
 could see. The clock trace was not.
@@ -58,7 +68,15 @@ could see. The clock trace was not.
 | --- | --- | --- |
 | 16-bit PCM, FiiO KA17 | 16-bit alternate | 32-bit alternate, sample in the top of the slot. KA17 has no 24-bit alternate |
 | 24-bit PCM, SMSL with Thesycon firmware | 32-bit alternate. ALSA has no 24-bit format on that card, so the padding byte is part of the slot | 24-bit alternate, when the DAC advertises one |
-| Same file on moOde, kernel entry | moOde turns resampling and automatic format conversion back on | resampling stays off, format stays the file width |
+| Same file on moOde, kernel entry | On the kernel path, moOde's MPD configuration resamples to 96 kHz by default. libampdac bypasses that: the file rate reaches the DAC unchanged | (no change; format stays the file width) |
+
+Whether that alternate difference is audible depends on the DAC firmware.
+On SMSL with Thesycon firmware, the 32-bit alternate plays the padding byte
+as audio; the 24-bit alternate does not. On FiiO KA17, which has no 24-bit
+alternate, this difference does not exist.
+
+On moOde, a separate difference applies: the kernel path resamples to 96 kHz
+by default. libampdac does not, so the file rate reaches the DAC unchanged.
 
 ## DACs this was run on
 
@@ -82,8 +100,9 @@ could see. The clock trace was not.
 - An adaptive or synchronous UAC2 endpoint can still be opened. That is not
   the clock-master path, and the notes above are not about it.
 - Volume on this path stays at unity. Use the control on the DAC.
-- There is no DeaDBeeF plugin. DeaDBeeF plays through the same ALSA device
-  as any other player: hardware output, resampling off.
+- DeaDBeeF sees libampdac as a normal ALSA device. Select it under
+  Preferences → Sound and turn DSP off. No plugin is needed; the transport
+  is below ALSA, not above it.
 
 A format change closes the USB session and opens another. PCM right after
 DSD waits while the DAC clock settles. Wait for that open. Do not start a
@@ -107,10 +126,10 @@ is no 32-bit moOde build.
 
 ### Debian
 
-```bash
+~~~
 sudo apt install ./ampdac_0.3.19-1_amd64.deb
 sudo usermod -aG audio "$USER"
-```
+~~~
 
 Log in again so the `audio` group applies. The package enables
 `ampdac.socket`. The daemon starts when something connects. `aplay -L`
@@ -119,7 +138,7 @@ lists `ampdac`. The socket is mode `0660`, group `audio`.
 In Audacious, Strawberry, DeaDBeeF, or MPD select the ALSA device `ampdac`
 and turn resampling off.
 
-```
+~~~
 audio_output {
     type            "alsa"
     name            "ampdac"
@@ -130,22 +149,22 @@ audio_output {
     dop             "yes"
     use_mmap        "no"
 }
-```
+~~~
 
 Remove it with:
 
-```bash
+~~~
 sudo dpkg -r ampdac
-```
+~~~
 
 ### Volumio 3
 
 Use the armhf package on a 32-bit image and the arm64 package on a 64-bit
 image. Installing restarts Volumio once, so the plugin process loads.
 
-```bash
+~~~
 sudo dpkg -i ampdac-volumio_0.3.19-1_armhf.deb
-```
+~~~
 
 Enable **ampdac** under Plugins → Installed plugins if it is off. Playback
 Options then lists the kernel card and **libampdac ·** the DAC name. Changing
@@ -163,9 +182,9 @@ move the output back to HDMI. Volume for that entry is the DAC knob.
 
 Remove it with:
 
-```bash
+~~~
 sudo dpkg -r ampdac-volumio
-```
+~~~
 
 That restores the kernel route, removes the Info button, and removes the
 units.
@@ -174,9 +193,9 @@ units.
 
 64-bit only. Tested path: moOde 10.3.6.
 
-```bash
+~~~
 sudo dpkg -i ampdac-moode_0.3.19-1_arm64.deb
-```
+~~~
 
 Configure → Audio → Output device lists the kernel DAC and
 **libampdac ·** the DAC name. Changing the list applies immediately, including
@@ -188,9 +207,9 @@ moOde sets them. The daemon is socket-activated and is not enabled at boot.
 
 Remove it with:
 
-```bash
+~~~
 sudo dpkg -r ampdac-moode
-```
+~~~
 
 That puts the output back on the kernel card and removes the extra list entry.
 
@@ -209,21 +228,21 @@ Nothing playing is `playback: idle`.
 themselves, not through `ampdacd`. Do not run them while a player holds
 `ampdac`. `play` needs `ffmpeg` on `PATH`.
 
-```bash
+~~~
 ampdac-cli probe
 ampdac-cli tone --rate 48000 --seconds 10
 ampdac-cli play /path/to/cd.flac
 ampdac-cli play --dop /path/to/track.dsf
-```
+~~~
 
 ## Build
 
 Only needed to compile. The packages above are already built.
 
-```bash
+~~~
 sudo apt install build-essential libusb-1.0-0-dev ffmpeg
 make
-```
+~~~
 
 Or `cmake -S . -B build && cmake --build build`.
 
@@ -252,7 +271,6 @@ toolchain and libusb sources.
 - **Dropouts while the Pi is busy.** The daemon asks for `SCHED_FIFO`. The
   systemd unit grants `CAP_SYS_NICE`. A hand-built binary needs the same
   capability, or it runs on the normal scheduler.
-
 ## License
 
 [MIT](LICENSE). Same as upstream. Keep the copyright notices.
