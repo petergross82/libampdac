@@ -1,0 +1,19 @@
+#!/bin/bash
+set -eu
+SRC=/usr/share/ampdac/volumio
+DEST=/data/plugins/miscellanea/ampdac
+
+if [ ! -d /data/plugins ]; then
+    echo "ampdac-volumio: /data/plugins is missing. This package is for Volumio." >&2
+    exit 1
+fi
+
+rm -rf "$DEST"
+mkdir -p /data/plugins/miscellanea
+cp -a "$SRC/." "$DEST/"
+bash "$DEST/install.sh"
+
+if systemctl list-unit-files volumio.service >/dev/null 2>&1; then
+    systemctl restart volumio || true
+fi
+exit 0

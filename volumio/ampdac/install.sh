@@ -115,7 +115,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable ampdac.socket >/dev/null 2>&1 || true
-systemctl enable ampdac.service >/dev/null 2>&1 || true
+systemctl disable ampdac.service >/dev/null 2>&1 || true
 systemctl reset-failed ampdac.service ampdac.socket >/dev/null 2>&1 || true
 if ! systemctl restart ampdac.socket; then
     systemctl status ampdac.socket --no-pager || true
@@ -147,7 +147,10 @@ bash "$HERE/unpatch-mpd.sh"
 if [ -x /usr/local/sbin/ampdac-asound ]; then
     /usr/local/sbin/ampdac-asound sync || true
 fi
-log "ampdac: установлено. Включите плагин и выберите «ampdac USB DAC»."
+if [ -f "$HERE/patch-volumio-ui.py" ]; then
+    python3 "$HERE/patch-volumio-ui.py" || log "ampdac: кнопку Info в списке плагинов поставить не удалось"
+fi
+log "ampdac: установлено. В параметрах воспроизведения выберите «libampdac · имя ЦАПа»."
 log "ampdac: проверка маршрута: ampdac show status"
 echo "plugininstallend"
 exit 0

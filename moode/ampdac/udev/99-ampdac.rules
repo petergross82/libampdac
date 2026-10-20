@@ -1,0 +1,10 @@
+# usbfs node for class-compliant USB DACs (Audio class 0x01, streaming 0x02).
+# libusb_open needs write on /dev/bus/usb/BBB/DDD — stock nodes are root:root 0664.
+#
+#   sudo cp linux/udev/99-ampdac.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb
+#   unplug/replug the DAC  (or run linux/grant-usb-dac.sh)
+#
+# Match ID_USB_INTERFACES like :010120:010220:… (UAC1/UAC2).
+
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0102??:*", MODE="0664", GROUP="plugdev", TAG+="uaccess"

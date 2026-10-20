@@ -1,0 +1,10 @@
+[Unit]
+Description=Point moOde at libampdac after the worker has seen the kernel card
+After=mpd.service ampdac-moode-prime.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ampdac-moode settle
+
+[Install]
+WantedBy=multi-user.target

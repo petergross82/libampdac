@@ -296,6 +296,74 @@ json_field() {
     ' "$VCONF"
 }
 
+reload_alsa_config() {
+    # libasound reads conf.d once per process. Touching the master file
+    # makes the next snd_pcm_open in this MPD pick up the new slave.
+    if [ -e /usr/share/alsa/alsa.conf ]; then
+        touch /usr/share/alsa/alsa.conf
+    fi
+    if [ -e /etc/alsa/alsa.conf ]; then
+        touch /etc/alsa/alsa.conf
+    fi
+}
+
+mpd_alsa_output_id() {
+    mpc outputs 2>/dev/null | awk '
+        /^Output / {
+            id = $2
+            gsub(/[^0-9]/, "", id)
+            if (index($0, "(alsa)") || index($0, " alsa")) {
+                print id
+                exit
+            }
+        }
+    '
+}
+
+kernel_card_visible() {
+    aplay -l 2>/dev/null | awk '
+        /card / {
+            line = tolower($0)
+            if (line ~ /hdmi/ || line ~ /bcm2835/ || line ~ /headphone/) next
+            found = 1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+# Close the open PCM, then open whatever slave is in asound.conf now.
+# The flag and the file are already written by the caller. No mpd restart.
+reopen_output() {
+    local id i
+    id="$(mpd_alsa_output_id || true)"
+    mpc -q pause >/dev/null 2>&1 || true
+    if [ -n "$id" ]; then
+        mpc -q disable "$id" >/dev/null 2>&1 || true
+    fi
+    if ! grep -q 'slave.pcm[[:space:]]*"ampdac"' "$CONF" 2>/dev/null; then
+        i=0
+        while [ "$i" -lt 40 ]; do
+            if kernel_card_visible; then
+                break
+            fi
+            i=$((i + 1))
+            sleep 0.1
+        done
+    fi
+    reload_alsa_config
+    if [ -n "$id" ]; then
+        i=0
+        while [ "$i" -lt 15 ]; do
+            if mpc -q enable "$id" >/dev/null 2>&1; then
+                break
+            fi
+            i=$((i + 1))
+            sleep 0.1
+        done
+    fi
+    echo reopened
+}
+
 PREV=/var/lib/ampdac.previous
 
 remember_args() {
@@ -335,6 +403,22 @@ case "$MODE" in
         rm -f "$FLAG"
         disable_watch
         echo off
+        ;;
+    live-off)
+        rm -f "$FLAG"
+        echo off
+        ;;
+    live-on)
+        mkdir -p /var/lib
+        touch "$FLAG"
+        if write_route; then
+            echo changed
+        else
+            echo unchanged
+        fi
+        ;;
+    reopen)
+        reopen_output
         ;;
     on|sync)
         if want_route || [ "$MODE" = "on" ]; then

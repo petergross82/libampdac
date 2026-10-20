@@ -1,0 +1,13 @@
+[Unit]
+Description=Leave the kernel DAC visible until moOde has finished booting
+Before=mpd.service
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ampdac-moode prime
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,73 +1,128 @@
 # libampdac
 
-Userspace **USB Audio Class 2** output for Linux. **ampdacd** holds the DAC
-and sends bit-perfect PCM, native DSD, and DSD-over-PCM (DoP) over libusb
-isochronous transfers. Players do not open the USB device. They open the
-ALSA device `ampdac`, which talks to `/run/ampdac.sock`.
+Userspace USB Audio Class 2 transport for Linux. **ampdacd** opens the DAC
+with libusb and writes isochronous OUT packets. A player never opens the USB
+device. It opens the ALSA device `ampdac`, and that device talks to
+`/run/ampdac.sock`.
 
-When the DAC publishes explicit feedback, its crystal is the clock master
-and the file rate is not changed. Unity gain leaves 16-bit and 24-bit
-samples in the top of the USB slot.
-
-This is not a fork of the Android player. The USB engine in [`native/`](native/)
-comes from that project (see [NOTICE](NOTICE)). Android, JNI, and FFmpeg stay
-there. Decode here is the player's job.
-
-**Upstream (original work, MIT):**  
+The engine in [`native/`](native/) comes from
 [androidexpert35/Audiophile-Music-Player](https://github.com/androidexpert35/Audiophile-Music-Player)
+(see [NOTICE](NOTICE)). This tree is not that player. Decode stays in the
+player. Android, JNI, and FFmpeg are not part of the transport.
 
-Packages: [v0.3.18](https://github.com/petergross82/libampdac/releases/tag/v0.3.18).
+## What it does
 
-## Install
+On a UAC2 DAC that publishes explicit feedback, the DAC crystal is the clock
+master. ampdacd counts the feedback endpoint and submits the next packets to
+match it. The file rate is not resampled. Gain on this path is unity, so a
+16-bit or 24-bit sample stays in the top of the USB slot and the padding bits
+stay zero.
 
-### Debian (amd64)
+When the DAC advertises both a 24-bit and a 32-bit 4-byte PCM alternate,
+24-bit PCM uses the 24-bit one. A packed 3-byte slot is used only when that
+rate and channel count have no 4-byte PCM alternate. Native DSD is used when
+the DAC advertises a raw DSD alternate. Otherwise DSD64, DSD128, and DSD256
+go out as DoP on a 4-byte PCM alternate. One client owns the DAC.
+
+`ampdac show transport` prints the DAC descriptor, the live stream, the
+feedback clock, the ring, and losses. The source also prints which alternate
+is open and which alternates the DAC advertises. The ARM binaries inside the
+Volumio and moOde packages below were built before that text; a desktop build
+of this tree includes it.
+
+## What we measured
+
+These figures are from captures on the machines and DACs below. They are
+examples, not a specification.
+
+The kernel driver `snd-usb-audio` and libampdac followed the same feedback.
+The host did not use a smoothed or free-running clock in either case.
+
+| Stream | Feedback, both paths |
+| --- | --- |
+| 44.1 kHz | 44099.61 Hz |
+| 96 kHz | 95999.02 Hz |
+| DSD128 | 176397.46 Hz |
+
+The packet rhythm is not the same. The kernel submits 6 or 7 packets per
+URB and completions landed around 0.8 ms apart. libampdac submits 8 packets
+and completions landed around 1 ms apart. On a laptop with an Ice Lake
+controller the libampdac capture had no `ECOMM`. On a Raspberry Pi, `ECOMM`
+at the moment the SMSL interface was claimed came from the host controller,
+not from the feedback loop.
+
+Where a recording sounded different, the USB alternate was the split we
+could see. The clock trace was not.
+
+| File | Kernel on that DAC | libampdac |
+| --- | --- | --- |
+| 16-bit PCM, FiiO KA17 | 16-bit alternate | 32-bit alternate, sample in the top of the slot. KA17 has no 24-bit alternate |
+| 24-bit PCM, SMSL with Thesycon firmware | 32-bit alternate. ALSA has no 24-bit format on that card, so the padding byte is part of the slot | 24-bit alternate, when the DAC advertises one |
+| Same file on moOde, kernel entry | moOde turns resampling and automatic format conversion back on | resampling stays off, format stays the file width |
+
+## DACs this was run on
+
+| DAC | Class | What played |
+| --- | --- | --- |
+| FiiO K7 | UAC2, asynchronous, explicit feedback | PCM up to 384 kHz / 32-bit, DSD up to DSD256. DSD512 and 768 kHz were left out: they were noisy, and the rate check does not accept DSD512 |
+| FiiO KA17 | UAC2, asynchronous, explicit feedback | PCM 44.1–768 kHz. Alternates: 32-bit, 16-bit, native DSD. DoP uses the 32-bit PCM alternate |
+| SMSL with Thesycon firmware (DS20, and the unit 152a:85dd) | UAC2, asynchronous, explicit feedback | 32-bit PCM, 24-bit PCM, native DSD |
+| Texas Instruments PCM2706C | UAC1 | Not opened. An interface whose protocol is not `0x20` is skipped |
+
+## What it does not do
+
+- It does not drive USB Audio Class 1.
+- It does not drive an I2S HAT, HDMI, an analogue jack, or a converter that
+  has no UAC2 interface.
+- It does not play DSD512, or any DSD rate other than DSD64, DSD128, and
+  DSD256.
+- It does not play more than two channels. The ALSA device accepts two.
+- It does not share the DAC. A second open gets "busy".
+- It does not run on Windows or macOS.
+- An adaptive or synchronous UAC2 endpoint can still be opened. That is not
+  the clock-master path, and the notes above are not about it.
+- Volume on this path stays at unity. Use the control on the DAC.
+- There is no DeaDBeeF plugin. DeaDBeeF plays through the same ALSA device
+  as any other player: hardware output, resampling off.
+
+A format change closes the USB session and opens another. PCM right after
+DSD waits while the DAC clock settles. Wait for that open. Do not start a
+second player on top of it.
+
+## Packages
+
+[v0.3.19](https://github.com/petergross82/libampdac/releases/tag/v0.3.19).
+
+| Package | Where |
+| --- | --- |
+| `ampdac_0.3.19-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
+| `ampdac-volumio_0.3.19-1_armhf.deb` | Volumio 3, 32-bit Pi |
+| `ampdac-volumio_0.3.19-1_arm64.deb` | Volumio 3, 64-bit Pi |
+| `ampdac-moode_0.3.19-1_arm64.deb` | moOde 10.3.6, 64-bit only |
+
+The Volumio package was installed with `dpkg` on a 32-bit Volumio 3 image.
+The moOde package runs the install script that was used on moOde 10.3.6.
+Both images are Raspberry Pi OS. The moOde image we used is 64-bit; there
+is no 32-bit moOde build.
+
+### Debian
 
 ```bash
-sudo apt install ./ampdac_0.3.18-1_amd64.deb
+sudo apt install ./ampdac_0.3.19-1_amd64.deb
 sudo usermod -aG audio "$USER"
 ```
 
 Log in again so the `audio` group applies. The package enables
-`ampdac.socket`. The daemon starts when something connects to the socket.
-`aplay -L` lists `ampdac`.
+`ampdac.socket`. The daemon starts when something connects. `aplay -L`
+lists `ampdac`. The socket is mode `0660`, group `audio`.
 
-The desktop socket is mode `0660` and group `audio`. `ampdac show transport`
-also needs `python3`, which the package depends on.
-
-### Volumio 3
-
-A factory image has no `unzip` and no zip upload on the developer page.
-Use the tar archive. On the Pi:
-
-```bash
-tar -xzf ampdac-volumio.tar.gz
-cd ampdac
-volumio plugin install
-```
-
-Answer `y` to the prompt about an unsafe plugin. The plugin ships prebuilt
-binaries for 32-bit and 64-bit Pi. Nothing is compiled on the device.
-
-The archive on the v0.3.18 release is plugin **0.3.17**. It does not yet
-contain the packed 3-byte PCM fallback. That fallback is in the Debian
-package.
-
-Enable the plugin, open Playback Options, and pick **ampdac USB DAC** next
-to the kernel card. MPD still opens the PCM device `volumio`. While that
-entry is selected, `/etc/asound.conf` points `volumio` at `ampdac`. The
-kernel card stays in the list. Disabling the plugin restores the card that
-was selected before. The Volumio socket is mode `0666`, because MPD's user
-is not in group `audio`.
-
-## Play
-
-In Audacious, Strawberry, or MPD select the ALSA device `ampdac` and turn
-resampling off. One client owns the DAC. A second open gets "busy".
+In Audacious, Strawberry, DeaDBeeF, or MPD select the ALSA device `ampdac`
+and turn resampling off.
 
 ```
 audio_output {
     type            "alsa"
-    name            "ampdac USB DAC"
+    name            "ampdac"
     device          "ampdac"
     mixer_type      "none"
     auto_resample   "no"
@@ -77,32 +132,82 @@ audio_output {
 }
 ```
 
-Moode rewrites `mpd.conf`. Put the block back after it does.
+Remove it with:
 
-Volume on this path stays at unity. Use the DAC's own control. A format
-change (44.1 to 96, or DSD to PCM) closes the USB session and opens another.
+```bash
+sudo dpkg -r ampdac
+```
+
+### Volumio 3
+
+Use the armhf package on a 32-bit image and the arm64 package on a 64-bit
+image. Installing restarts Volumio once, so the plugin process loads.
+
+```bash
+sudo dpkg -i ampdac-volumio_0.3.19-1_armhf.deb
+```
+
+Enable **ampdac** under Plugins → Installed plugins if it is off. Playback
+Options then lists the kernel card and **libampdac ·** the DAC name. Changing
+the output applies immediately. MPD is not restarted: the output is closed
+and opened again, and the queue stays. A gap of about two seconds is the
+USB handoff. On the 32-bit image, Unplugged went to the kernel card and back
+with the position kept.
+
+The Info button on the ampdac row runs `ampdac show transport`.
+
+The kernel entry is Volumio's normal plug → hardware path. The libampdac
+entry is the socket. While libampdac is selected, a USB rebind does not
+move the output back to HDMI. Volume for that entry is the DAC knob.
+`ampdac.service` is not enabled at boot. The socket starts the daemon.
+
+Remove it with:
+
+```bash
+sudo dpkg -r ampdac-volumio
+```
+
+That restores the kernel route, removes the Info button, and removes the
+units.
+
+### moOde
+
+64-bit only. Tested path: moOde 10.3.6.
+
+```bash
+sudo dpkg -i ampdac-moode_0.3.19-1_arm64.deb
+```
+
+Configure → Audio → Output device lists the kernel DAC and
+**libampdac ·** the DAC name. Changing the list applies immediately, including
+during playback. The gap is the USB handoff. Clicks or a short pause are
+expected. MPD is not restarted and the queue stays. CamillaDSP and the moOde
+equaliser are not in the chain while libampdac is selected. The kernel entry
+is moOde's normal route, with resampling and automatic format conversion as
+moOde sets them. The daemon is socket-activated and is not enabled at boot.
+
+Remove it with:
+
+```bash
+sudo dpkg -r ampdac-moode
+```
+
+That puts the output back on the kernel card and removes the extra list entry.
 
 ## Utilities
 
-`/usr/bin/ampdac` is the same program on Debian and on Volumio. Both
-commands print English.
+`/usr/bin/ampdac` is the same program on Debian, Volumio, and moOde.
 
-`ampdac show status` says which output is open. It lists kernel cards,
-whether `ampdacd` is running, and the player holding the socket. On Volumio
-it also prints the web label, the `volumio` PCM route, and the MPD outputs,
-because those three can disagree. On Debian those Volumio blocks are
-omitted. If `/etc/mpd.conf` exists, its outputs are still listed.
+`ampdac show status` says which output is open, whether `ampdacd` is
+running, and which player holds the socket. On Volumio it also prints the
+web label, the `volumio` PCM route, and the MPD outputs.
 
-`ampdac show transport` asks the daemon for one screen: DAC name, USB id,
-clocking, channel count, PCM rates and bit depths, native DSD and DoP, then
-the live stream, the feedback clock, the ring, and losses. Nothing playing
-is `playback: idle`. On Volumio, if the route is not `ampdac`, it adds
-`plugin: inactive` and names the kernel card when that card is playing.
+`ampdac show transport` prints one screen for the DAC and the live stream.
+Nothing playing is `playback: idle`.
 
-`ampdac-cli` is a separate program. `list` and `probe` describe the DAC.
-`play` and `tone` open the USB device themselves, not through `ampdacd`.
-Do not run them while a player is using `ampdac`. `play` needs `ffmpeg` on
-`PATH`.
+`ampdac-cli` is a separate program. `play` and `tone` open the USB device
+themselves, not through `ampdacd`. Do not run them while a player holds
+`ampdac`. `play` needs `ffmpeg` on `PATH`.
 
 ```bash
 ampdac-cli probe
@@ -110,41 +215,6 @@ ampdac-cli tone --rate 48000 --seconds 10
 ampdac-cli play /path/to/cd.flac
 ampdac-cli play --dop /path/to/track.dsf
 ```
-
-## Hardware
-
-The transport is built for one class-compliant **USB Audio Class 2** DAC
-in the asynchronous case: the DAC crystal is clock master and the device
-provides an explicit feedback endpoint. PCM keeps the file rate. 16-bit and
-24-bit samples sit in the top of a 4-byte slot. The lower bits stay zero
-at unity gain. If the DAC publishes both a 24-bit and a 32-bit 4-byte
-alternate, 24-bit PCM uses the 24-bit one. A packed 3-byte slot is used
-only when that rate and channel count have no 4-byte PCM alternate. Native
-DSD is used when a RAW / Type IV alternate is advertised. Otherwise DSD64,
-DSD128, and DSD256 go out as DoP on a 4-byte PCM alternate. Stereo only.
-
-Brought up on a FiiO K7, as the kernel card and through this transport, on
-Volumio and on Debian.
-
-It will not play:
-
-- A USB Audio Class 1 device. Interfaces whose protocol is not UAC2
-  (`0x20`) are skipped.
-- Anything that is not a USB DAC: I2S HATs, HDMI, analogue jacks,
-  S/PDIF-only converters.
-- A PCM DAC whose only subslot is 2 bytes. The formatter accepts a 4-byte
-  slot, and a 3-byte slot only as the fallback above.
-- DSD512, or any DSD rate other than DSD64, DSD128, and DSD256.
-- DoP into a DAC that has no 4-byte PCM alternate. The DoP marker lives in
-  the top byte of that slot.
-- More than two channels. DSD must be stereo, and the ALSA device `ampdac`
-  accepts two channels only.
-- A second player while the first still holds the DAC.
-- Windows or macOS.
-
-An adaptive or synchronous UAC2 endpoint can still be opened. That is not
-the clock-master path. The bit-perfect claim is for asynchronous feedback
-devices.
 
 ## Build
 
@@ -158,35 +228,27 @@ make
 Or `cmake -S . -B build && cmake --build build`.
 
 Artifacts: `build/libampdac.so`, `build/ampdacd`, `build/ampdac-cli`,
-`build/libasound_module_pcm_ampdac.so`, `build/ddb_out_ampdac.so`.
+`build/libasound_module_pcm_ampdac.so`.
 `./build/ipc_smoke ./build/ampdacd` checks the socket without a DAC.
 `scripts/build-deb.sh` rebuilds the Debian package.
-`scripts/build-volumio-plugin.sh` cross-builds the Pi plugin. It needs a
-Zig toolchain and libusb sources. The Pi does not compile.
-
-Deadbeef 1.10 connects to `ampdacd`. It forces FFmpeg DoP so DSF/DFF are
-not converted to float, then asks the daemon for native DSD when the DAC
-has it. DSP off. Start the daemon first.
-
-```bash
-make plugin
-make install-deadbeef DEADBEEF_DIR=$HOME/deadbeef-1.10.3
-```
+`scripts/build-player-debs.sh` packs the Volumio and moOde packages from
+`volumio/ampdac/bin` and `moode/ampdac/bin`. It does not cross-compile.
+`scripts/build-volumio-plugin.sh` is the cross build. It needs a Zig
+toolchain and libusb sources.
 
 ## Troubleshooting
 
 - **`ampdac show transport` cannot reach the socket on Debian.** The user
   is not in group `audio`, or the login is from before `usermod`. Log in
   again.
-- **The DAC stays on the kernel card.** On Volumio the plugin is off or
-  Playback Options still name the kernel card. `ampdac show status` prints
-  both the web label and the route.
+- **The DAC stays on the kernel card.** On Volumio the plugin is off, or
+  Playback Options still names the kernel card. On moOde the Output device
+  list still names the kernel card. `ampdac show status` prints the route.
 - **claim returns BUSY.** PipeWire, Pulse, or the kernel driver still holds
   the card. Stop that playback. On a desktop,
   `systemctl --user stop pipewire pipewire-pulse wireplumber`.
-- **PCM right after DSD is silent.** The DAC's clock has to settle after
-  the DSD session. The next open retries the clock set. Wait for that open
-  to finish instead of starting a second player.
+- **PCM right after DSD is silent.** The DAC clock has to settle after the
+  DSD session. The next open retries the clock set.
 - **Dropouts while the Pi is busy.** The daemon asks for `SCHED_FIFO`. The
   systemd unit grants `CAP_SYS_NICE`. A hand-built binary needs the same
   capability, or it runs on the normal scheduler.

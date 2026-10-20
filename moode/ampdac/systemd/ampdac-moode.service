@@ -1,0 +1,7 @@
+[Unit]
+Description=Restore the libampdac route in moOde _audioout.conf
+
+[Service]
+Type=oneshot
+Environment=AMPDAC_WATCH=1
+ExecStart=/usr/local/sbin/ampdac-moode apply

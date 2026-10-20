@@ -43,6 +43,14 @@ void set_error(const std::string &message) {
 constexpr uint32_t kIsoPoolSize = 16;
 constexpr uint32_t kIsoPacketsPerTransfer = 8;
 constexpr std::size_t kWriteChunkBytes = 16U * 1024U;
+/* alsa/pcm_ampdac.c rejects a buffer under 64 KB. The hw pointer stays
+ * put until USB consumes, so a larger prefill never arrives and the
+ * stream never starts. */
+constexpr std::size_t kClientBufferFloorBytes = 64U * 1024U;
+/* Two in-flight queues: prime_out_buffers takes one, the ring must
+ * still hold another when the first callback runs. 16 URBs of 8
+ * microframes is 32 ms; 50 ms leaves that queue plus a margin. */
+constexpr uint32_t kPrefillMs = 50;
 constexpr int kWriteTimeoutMs = 2000;
 constexpr useconds_t kWritePollUs = 500U;
 constexpr useconds_t kDsdPllSettleUs = 50000U;
@@ -473,6 +481,20 @@ ampdac_status program_usb_stream(
     return AMPDAC_OK;
 }
 
+std::size_t playback_prefill_bytes(const UsbPcmWireFormat &wire) {
+    const uint64_t bpf = wire.bytes_per_frame();
+    uint64_t bytes = 0;
+    if (wire.sample_rate_hz > 0U && bpf > 0U) {
+        bytes = static_cast<uint64_t>(wire.sample_rate_hz) * bpf *
+                kPrefillMs / 1000U;
+    }
+    const uint64_t primed = static_cast<uint64_t>(kIsoPoolSize) *
+            kIsoPacketsPerTransfer * (bpf > 0U ? bpf : 8U);
+    if (bytes < primed * 2U) bytes = primed * 2U;
+    if (bytes > kClientBufferFloorBytes) bytes = kClientBufferFloorBytes;
+    return static_cast<std::size_t>(bytes);
+}
+
 int push_wire_with_prefill(
         ampdac_session *session,
         const uint8_t *wire,
@@ -481,6 +503,8 @@ int push_wire_with_prefill(
         UsbPlaybackState live_state) {
     const auto deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(kWriteTimeoutMs);
+    const std::size_t prefill_goal =
+            playback_prefill_bytes(session->ctx->pcm_wire_format);
     std::size_t chunk_offset = 0;
     while (chunk_offset < wire_bytes) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -501,8 +525,6 @@ int push_wire_with_prefill(
         chunk_offset += push_bytes;
 
         if (!*transfers_started) {
-            const std::size_t prefill_goal =
-                    session->ctx->ring_buffer->capacity() / 2U;
             if (session->ctx->ring_buffer->size() < prefill_goal) {
                 continue;
             }
@@ -1129,15 +1151,6 @@ extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t byt
                             static_cast<std::ptrdiff_t>(carry_offset));
         }
 
-        if (!transfers_started && session->ctx->ring_buffer->size() > 0U) {
-            const int submitted = session->ctx->transfer_pool->submit_all_transfers();
-            if (submitted < 1) {
-                set_error("ISO transfer submission failed");
-                return AMPDAC_ERR_IO;
-            }
-            session->transfers_started = true;
-            (void)session->ctx->playback_state.transition_to(live);
-        }
         return static_cast<int>(bytes);
     }
 
@@ -1270,17 +1283,6 @@ extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t byt
         input_offset += in_chunk;
     }
 
-    if (!transfers_started && session->ctx->ring_buffer->size() > 0U) {
-        const int submitted = session->ctx->transfer_pool->submit_all_transfers();
-        if (submitted < 1) {
-            set_error("ISO transfer submission failed");
-            return AMPDAC_ERR_IO;
-        }
-        session->transfers_started = true;
-        (void)session->ctx->playback_state.transition_to(
-                UsbPlaybackState::StreamingPcm);
-    }
-
     return static_cast<int>(input_offset);
 }
 
@@ -1348,6 +1350,18 @@ static ampdac_status probe_open_session(ampdac_session *session,
         } else if (ep.usage_type == UAC_ISO_USAGE_IMPLICIT &&
                    out->feedback == AMPDAC_FEEDBACK_NONE) {
             out->feedback = AMPDAC_FEEDBACK_IMPLICIT;
+        }
+        if (out->alt_count < AMPDAC_MAX_ALTS) {
+            ampdac_alt_info &slot = out->alts[out->alt_count];
+            slot.interface_number = ep.interface_number;
+            slot.alt_setting = ep.alt_setting;
+            slot.channels = ep.as_general.nr_channels;
+            slot.subslot_bytes = ep.as_general.subslot_size;
+            slot.valid_bits = ep.as_general.bit_resolution;
+            slot.native_dsd = uac2_classify_endpoint_dsd(ep.as_general).is_native_dsd
+                    ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+            slot.bytes_per_uframe = ep.effective_bytes_per_uframe;
+            out->alt_count++;
         }
     }
     out->sync = static_cast<ampdac_sync_mode>(sync);

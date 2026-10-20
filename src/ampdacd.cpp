@@ -179,6 +179,33 @@ std::string format_caps(const ampdac_capabilities &caps) {
     out += format_number_list("PCM bits:", depths.data(), static_cast<int>(depths.size()));
     out += format_number_list("PCM rates:", caps.sample_rates, caps.sample_rate_count);
 
+    if (caps.alt_count <= 0) {
+        out += "alts: none reported\n";
+    } else {
+        out += "alts:\n";
+        for (int i = 0; i < caps.alt_count; ++i) {
+            const ampdac_alt_info &alt = caps.alts[i];
+            if (alt.native_dsd != 0U) {
+                std::snprintf(line, sizeof(line),
+                              "  interface %u alt %u  native DSD  %u ch  %u bytes/uframe\n",
+                              alt.interface_number, alt.alt_setting,
+                              alt.channels, alt.bytes_per_uframe);
+            } else if (alt.valid_bits > 0U && alt.subslot_bytes > 0U) {
+                std::snprintf(line, sizeof(line),
+                              "  interface %u alt %u  PCM  %u bit  %u-byte slot  %u ch  %u bytes/uframe\n",
+                              alt.interface_number, alt.alt_setting,
+                              alt.valid_bits, alt.subslot_bytes,
+                              alt.channels, alt.bytes_per_uframe);
+            } else {
+                std::snprintf(line, sizeof(line),
+                              "  interface %u alt %u  PCM  %u ch  %u bytes/uframe\n",
+                              alt.interface_number, alt.alt_setting,
+                              alt.channels, alt.bytes_per_uframe);
+            }
+            out += line;
+        }
+    }
+
     if (caps.native_dsd != 0U) {
         std::snprintf(line, sizeof(line),
                       "DSD native: yes, interface %u, alt %u\n",
@@ -277,6 +304,21 @@ std::string format_transport(const ampdac_negotiated &n, const ampdac_stream_sta
                       n.sample_rate_hz, n.valid_bits, n.channels);
     }
     if (line[0] != '\0') out += line;
+
+    if (n.dsd && n.dsd_native) {
+        std::snprintf(line, sizeof(line),
+                      "alt: interface %u, alt %u, native DSD\n",
+                      n.interface_number, n.alt_setting);
+    } else if (n.dsd) {
+        std::snprintf(line, sizeof(line),
+                      "alt: interface %u, alt %u, DoP, %u valid bits, %u-byte slot\n",
+                      n.interface_number, n.alt_setting, n.valid_bits, n.subslot_bytes);
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "alt: interface %u, alt %u, %u valid bits, %u-byte slot\n",
+                      n.interface_number, n.alt_setting, n.valid_bits, n.subslot_bytes);
+    }
+    out += line;
 
     if (n.sync == AMPDAC_SYNC_ASYNC && n.feedback == AMPDAC_FEEDBACK_EXPLICIT) {
         if (st.feedback_q16_16 == 0u) {
@@ -748,7 +790,11 @@ int main(int argc, char **argv) {
 
     g_stop.store(true);
     shutdown_clients();
-    ::shutdown(listen_fd, SHUT_RDWR);
+    // shutdown() on a socket passed by systemd makes the socket unit fail
+    // with "Got POLLHUP on a listening socket". Close it and leave the inode.
+    if (unlink_on_exit) {
+        ::shutdown(listen_fd, SHUT_RDWR);
+    }
     close(listen_fd);
 
     for (int i = 0; i < 30; ++i) {

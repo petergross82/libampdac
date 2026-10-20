@@ -1,0 +1,10 @@
+[Unit]
+Description=Put moOde _audioout back on libampdac after moOde rewrites it
+
+[Path]
+PathChanged=/etc/alsa/conf.d/_audioout.conf
+PathChanged=/etc/alsa/conf.d/_sndaloop.conf
+Unit=ampdac-moode.service
+
+[Install]
+WantedBy=multi-user.target

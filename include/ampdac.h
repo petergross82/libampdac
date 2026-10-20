@@ -130,6 +130,19 @@ typedef struct ampdac_negotiated {
 
 #define AMPDAC_MAX_RATES 64
 #define AMPDAC_MAX_DEPTHS 8
+#define AMPDAC_MAX_ALTS 16
+
+/** One UAC2 streaming alternate the DAC advertises. Alt 0 is the idle setting and is omitted. */
+typedef struct ampdac_alt_info {
+    uint8_t interface_number;
+    uint8_t alt_setting;
+    uint8_t channels;
+    uint8_t subslot_bytes;
+    uint8_t valid_bits;
+    /** Non-zero when this alt is native DSD rather than PCM. */
+    uint8_t native_dsd;
+    uint16_t bytes_per_uframe;
+} ampdac_alt_info;
 
 typedef struct ampdac_capabilities {
     ampdac_device_info device;
@@ -147,6 +160,8 @@ typedef struct ampdac_capabilities {
     uint8_t native_dsd_alt;
     uint8_t dop_pcm_alt;
     char notes[256];
+    ampdac_alt_info alts[AMPDAC_MAX_ALTS];
+    int alt_count;
 } ampdac_capabilities;
 
 typedef struct ampdac_session ampdac_session;

@@ -35,14 +35,11 @@ BUILD := build
 OBJS := $(patsubst %.cpp,$(BUILD)/%.o,$(notdir $(SRCS)))
 HDRS := $(wildcard include/*.h) $(wildcard src/*.h) $(wildcard $(NATIVE)/*.h)
 
-DEADBEEF_INC ?= plugins/deadbeef/include
-DEADBEEF_DIR ?= $(HOME)/deadbeef-1.10.3
-
 ALSA_CFLAGS := $(shell pkg-config --cflags alsa 2>/dev/null)
 ALSA_LIBS := $(shell pkg-config --libs alsa 2>/dev/null)
 
-.PHONY: all clean plugin alsa-plugin install-deadbeef
-all: $(BUILD)/libampdac.so $(BUILD)/libampdac_client.so $(BUILD)/ampdac-cli $(BUILD)/ampdacd $(BUILD)/ipc_smoke plugin alsa-plugin
+.PHONY: all clean alsa-plugin
+all: $(BUILD)/libampdac.so $(BUILD)/libampdac_client.so $(BUILD)/ampdac-cli $(BUILD)/ampdacd $(BUILD)/ipc_smoke alsa-plugin
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -75,13 +72,6 @@ $(BUILD)/ampdacd: src/ampdacd.cpp $(BUILD)/libampdac.so
 $(BUILD)/ipc_smoke: tests/ipc_smoke.c $(BUILD)/ampdac_client.o
 	$(CC) -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE -Iinclude -o $@ tests/ipc_smoke.c $(BUILD)/ampdac_client.o
 
-$(BUILD)/ampdac_output.o: plugins/deadbeef/ampdac_output.c | $(BUILD)
-	$(CC) -std=c11 -fPIC -O2 -Wall -Wextra -D_GNU_SOURCE \
-		-Iinclude -I$(DEADBEEF_INC) -c $< -o $@
-
-$(BUILD)/ddb_out_ampdac.so: $(BUILD)/ampdac_output.o $(BUILD)/ampdac_client.o
-	$(CC) -shared -o $@ $^
-
 $(BUILD)/pcm_ampdac.o: alsa/pcm_ampdac.c $(BUILD)/ampdac_client.o | $(BUILD)
 	$(CC) -std=c11 -fPIC -DPIC -O2 -Wall -Wextra -D_GNU_SOURCE -Iinclude $(ALSA_CFLAGS) -c $< -o $@
 
@@ -89,12 +79,6 @@ $(BUILD)/libasound_module_pcm_ampdac.so: $(BUILD)/pcm_ampdac.o $(BUILD)/ampdac_c
 	$(CC) -shared -o $@ $^ $(ALSA_LIBS)
 
 alsa-plugin: $(BUILD)/libasound_module_pcm_ampdac.so
-
-plugin: $(BUILD)/ddb_out_ampdac.so
-
-install-deadbeef: plugin
-	rm -f $(DEADBEEF_DIR)/plugins/libampdac.so
-	install -m 755 $(BUILD)/ddb_out_ampdac.so $(DEADBEEF_DIR)/plugins/ddb_out_ampdac.so
 
 clean:
 	rm -rf $(BUILD)

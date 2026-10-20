@@ -1,0 +1,8 @@
+#!/bin/bash
+set -eu
+if [ "$(uname -m)" != "aarch64" ]; then
+    echo "ampdac-moode: this package is for 64-bit moOde (aarch64)." >&2
+    exit 1
+fi
+bash /usr/share/ampdac/moode/install.sh
+exit 0

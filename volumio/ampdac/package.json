@@ -1,7 +1,7 @@
 {
   "name": "ampdac",
-  "version": "0.3.17",
-  "description": "Bit-perfect UAC2 output through ampdacd. Adds an ampdac USB DAC entry next to the kernel card in Volumio playback options.",
+  "version": "0.3.19",
+  "description": "Bit-perfect UAC2 output through ampdacd. Playback Options lists the kernel card and libampdac for the same DAC.",
   "main": "index.js",
   "author": "petergross82",
   "license": "MIT",

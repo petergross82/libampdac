@@ -1,6 +1,9 @@
 #!/bin/bash
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HERE/patch-volumio-ui.py" ]; then
+    python3 "$HERE/patch-volumio-ui.py" --remove || true
+fi
 bash "$HERE/unpatch-mpd.sh" || true
 systemctl disable --now ampdac-asound.path ampdac-asound.service >/dev/null 2>&1 || true
 rm -f /var/lib/ampdac.route

@@ -12,7 +12,7 @@ try {
 var AMPDAC_CARD = {
     id: 'ampdac',
     alsacard: 'ampdac',
-    name: 'ampdac USB DAC'
+    name: 'libampdac'
 };
 
 // Volumio compares the promise with kew via Object.prototype.toString.
@@ -161,13 +161,39 @@ function installHooks(self) {
 
     alsa._ampdacOrigGetAlsaCards = alsa.getAlsaCards;
     alsa._ampdacOrigUpdate = alsa.internalUpdateALSAConfigFile;
+    alsa._ampdacOrigUpdateFile = alsa.updateALSAConfigFile;
     alsa._ampdacOrigSetMixer = alsa.setDefaultMixer;
     alsa._ampdacOrigSave = alsa.saveAlsaOptions;
 
+    if (typeof alsa.updateALSAConfigFile === 'function') {
+        // The stock wrapper always sets alsa.outputdevice. MPD's callback
+        // treats that as a new device and restarts itself, dropping the queue.
+        alsa.updateALSAConfigFile = function () {
+            var self = this;
+            function run() {
+                return self.internalUpdateALSAConfigFile();
+            }
+            var prev = self.pendingALSAConfigUpdate;
+            var promise = prev && typeof prev.then === 'function' ? prev.then(run, run) : run();
+            self.pendingALSAConfigUpdate = promise;
+            return promise;
+        };
+    }
+
     if (typeof alsa.saveAlsaOptions === 'function') {
         alsa.saveAlsaOptions = function (data) {
+            var state = null;
+            try {
+                state = this.commandRouter.volumioGetState();
+            } catch (e) {}
+            this._ampdacWasPlaying = !!(state && state.status === 'play');
             var incoming = data && data.output_device;
             var incomingId = incoming && (incoming.value !== undefined ? incoming.value : incoming.id);
+            var previousId = '';
+            try {
+                previousId = String(this.config.get('outputdevice') || '');
+            } catch (e) {}
+            this._ampdacUserSwitch = String(incomingId) !== previousId;
             if (String(incomingId) === 'ampdac') {
                 rememberCurrent(alsa);
             }
@@ -178,19 +204,46 @@ function installHooks(self) {
     alsa.getAlsaCards = function () {
         var cards = alsa._ampdacOrigGetAlsaCards.call(this);
         var i;
+        var live = null;
+        var hasAmp = false;
         if (!cards) {
             cards = [];
         }
         for (i = 0; i < cards.length; i++) {
-            if (cards[i] && String(cards[i].id) === 'ampdac') {
-                return cards;
+            if (!cards[i]) {
+                continue;
+            }
+            if (String(cards[i].id) === 'ampdac') {
+                hasAmp = true;
+                continue;
+            }
+            if (!live && !builtinCard(cards[i])) {
+                live = cards[i];
             }
         }
-        cards.push({
-            id: AMPDAC_CARD.id,
-            alsacard: AMPDAC_CARD.alsacard,
-            name: AMPDAC_CARD.name
-        });
+        var remembered = rememberedCard();
+        if (live) {
+            noteLiveDac(this, live);
+        } else if (remembered && !listHasCard(cards, remembered)) {
+            cards.push(remembered);
+        }
+        var dacName = (live && live.name) || (remembered && remembered.name) || 'USB DAC';
+        var pretty = 'libampdac · ' + dacName;
+        rememberAmpdacLabel(this, pretty);
+        if (hasAmp) {
+            for (i = 0; i < cards.length; i++) {
+                if (cards[i] && String(cards[i].id) === 'ampdac') {
+                    cards[i].name = pretty;
+                    cards[i].alsacard = AMPDAC_CARD.alsacard;
+                }
+            }
+        } else {
+            cards.push({
+                id: AMPDAC_CARD.id,
+                alsacard: AMPDAC_CARD.alsacard,
+                name: pretty
+            });
+        }
         return cards;
     };
 
@@ -230,11 +283,19 @@ function installHooks(self) {
     alsa.internalUpdateALSAConfigFile = function () {
         var alsaSelf = this;
         var use = ampdacSelected(alsaSelf);
+        var wasPlaying = !!alsaSelf._ampdacWasPlaying;
+        var userSwitch = !!alsaSelf._ampdacUserSwitch;
+        alsaSelf._ampdacUserSwitch = false;
+        alsaSelf._ampdacWasPlaying = false;
+        var desired = use ? 'ampdac' : 'kernel';
+        var switched = alsaSelf._ampdacApplied !== undefined && alsaSelf._ampdacApplied !== desired;
         setUsbIgnore(alsaSelf, use);
         var d = libQ ? libQ.defer() : pending();
-        // Drop the flag before the stock writer runs, or the path unit
-        // puts the ampdac route back on top of the kernel card.
-        exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound ' + (use ? 'on' : 'off'),
+        // live-on writes the ampdac route and sets the flag before MPD
+        // reopens. live-off clears the flag before the stock writer, so
+        // the path unit does not put the plugin route back. Neither mode
+        // restarts mpd or reloads systemd.
+        exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound ' + (use ? 'live-on' : 'live-off'),
             function (err, stdout, stderr) {
                 var text = ((stdout || '') + '\n' + (stderr || '')).trim();
                 if (text && self.logger) {
@@ -243,8 +304,38 @@ function installHooks(self) {
                 if (err && self.logger) {
                     self.logger.error(err.message);
                 }
+                function reopen() {
+                    exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound reopen',
+                        function (reopenErr, reopenOut, reopenErrText) {
+                            var reopenText = ((reopenOut || '') + '\n' + (reopenErrText || '')).trim();
+                            if (reopenText && self.logger) {
+                                self.logger.info('ampdac: reopen ' + reopenText);
+                            }
+                            if (reopenErr && self.logger) {
+                                self.logger.error(reopenErr.message);
+                            }
+                            if (wasPlaying) {
+                                resumePlayback(alsaSelf);
+                            }
+                            // changed:true makes Volumio set alsa.outputdevice and
+                            // that callback restarts MPD, which drops the queue.
+                            d.resolve({changed: false});
+                        });
+                }
+                function finish(wrote) {
+                    alsaSelf._ampdacApplied = desired;
+                    // Reopen when the user picked the other output or the
+                    // route file itself changed. Applying the already saved
+                    // route at startup leaves a playing MPD alone.
+                    if (!(wrote || switched || userSwitch)) {
+                        d.resolve({changed: false});
+                        return;
+                    }
+                    reopen();
+                }
                 if (use) {
-                    d.resolve({changed: !err && text.indexOf('unchanged') !== 0});
+                    var wrote = text.indexOf('unchanged') !== 0 && text.indexOf('changed') === 0;
+                    finish(wrote);
                     return;
                 }
                 var orig = null;
@@ -254,13 +345,13 @@ function installHooks(self) {
                     if (self.logger) {
                         self.logger.error(e.message || e);
                     }
-                    d.resolve({changed: false});
+                    reopen();
                     return;
                 }
                 if (orig && typeof orig.then === 'function') {
-                    orig.then(function (v) { d.resolve(v); }, function () { d.resolve({changed: false}); });
+                    orig.then(function () { finish(userSwitch || switched); }, function () { finish(userSwitch || switched); });
                 } else {
-                    d.resolve({changed: true});
+                    finish(userSwitch || switched);
                 }
             });
         return d.promise;
@@ -268,13 +359,23 @@ function installHooks(self) {
 
     alsa._ampdacHooked = true;
     setUsbIgnore(alsa, ampdacSelected(alsa));
+    try {
+        var seeded = alsa._ampdacOrigGetAlsaCards.call(alsa) || [];
+        var si;
+        for (si = 0; si < seeded.length; si++) {
+            if (seeded[si] && String(seeded[si].id) !== 'ampdac' && !builtinCard(seeded[si])) {
+                noteLiveDac(alsa, seeded[si]);
+                break;
+            }
+        }
+    } catch (e) {}
     if (ampdacSelected(alsa)) {
         writeAmpdacAsound(self.logger, 'sync');
     } else {
         rememberCurrent(alsa);
     }
     if (self.logger) {
-        self.logger.info('ampdac: в списке выходов есть «ampdac USB DAC»');
+        self.logger.info('ampdac: в списке выходов есть ядро и libampdac');
     }
     return true;
 }
@@ -307,6 +408,9 @@ function removeHooks(alsa) {
     }
     if (alsa._ampdacOrigUpdate) {
         alsa.internalUpdateALSAConfigFile = alsa._ampdacOrigUpdate;
+    }
+    if (alsa._ampdacOrigUpdateFile) {
+        alsa.updateALSAConfigFile = alsa._ampdacOrigUpdateFile;
     }
     if (alsa._ampdacOrigSetMixer) {
         alsa.setDefaultMixer = alsa._ampdacOrigSetMixer;
@@ -382,6 +486,71 @@ function unregisterMpdOutput(self) {
 
 function shellArg(value) {
     return "'" + String(value == null ? '' : value).replace(/'/g, "'\\''") + "'";
+}
+
+function builtinCard(card) {
+    var label = String(card.name || '') + ' ' + String(card.id || '') + ' ' + String(card.alsacard || '');
+    return /bcm2835|hdmi|headphone/i.test(label);
+}
+
+function listHasCard(cards, remembered) {
+    var i;
+    for (i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        if (!c) {
+            continue;
+        }
+        if (String(c.id) === String(remembered.id) ||
+                (remembered.alsacard && String(c.alsacard) === String(remembered.alsacard))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function rememberAmpdacLabel(alsa, pretty) {
+    if (!ampdacSelected(alsa) || alsa._ampdacLabel === pretty) {
+        return;
+    }
+    var current = '';
+    try {
+        current = String(alsa.config.get('outputdevicename') || '');
+    } catch (e) {}
+    if (current === pretty) {
+        alsa._ampdacLabel = pretty;
+        return;
+    }
+    alsa._ampdacLabel = pretty;
+    try {
+        alsa.setConfigParam({key: 'outputdevicename', value: pretty});
+    } catch (e) {}
+}
+
+function noteLiveDac(alsa, live) {
+    var key = String(live.id) + '\t' + String(live.name || '') + '\t' + String(live.alsacard || '');
+    if (alsa._ampdacNoted === key) {
+        return;
+    }
+    alsa._ampdacNoted = key;
+    exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound remember ' +
+        shellArg(live.id) + ' ' + shellArg(live.name || '') + ' ' + shellArg(live.alsacard || ''));
+}
+
+function resumePlayback(alsa) {
+    try {
+        if (alsa.commandRouter && typeof alsa.commandRouter.volumioPlay === 'function') {
+            alsa.commandRouter.volumioPlay();
+            return;
+        }
+    } catch (e) {}
+    exec('/usr/bin/mpc -q play');
+}
+
+function escapeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
 function rememberCurrent(alsa) {
@@ -536,6 +705,41 @@ function stopAfterOff(self, alsa, next, switching, d) {
 // output. Volumio plays device "volumio"; the card list selects the route.
 ControllerAmpdac.prototype.getMpdOutput = function () {
     return '';
+};
+
+ControllerAmpdac.prototype.showTransport = function () {
+    var self = this;
+    var d = libQ ? libQ.defer() : pending();
+    exec('/usr/bin/ampdac show transport', {timeout: 8000, maxBuffer: 256 * 1024},
+        function (err, stdout, stderr) {
+            var text = String(stdout || '');
+            if (stderr) {
+                text += (text ? '\n' : '') + String(stderr);
+            }
+            if (!text.trim()) {
+                text = err ? String(err.message || err) : 'ampdac show transport: пусто';
+            }
+            var html = '<pre>' + escapeHtml(text) + '</pre>';
+            try {
+                self.commandRouter.broadcastMessage('openModal', {
+                    title: 'ampdac',
+                    message: html,
+                    size: 'lg',
+                    buttons: [{
+                        name: 'Close',
+                        class: 'btn btn-info',
+                        emit: 'closeModals',
+                        payload: ''
+                    }]
+                });
+            } catch (e) {
+                if (self.logger) {
+                    self.logger.error(e.message || e);
+                }
+            }
+            d.resolve({});
+        });
+    return d.promise;
 };
 
 ControllerAmpdac.prototype.getUIConfig = function () {

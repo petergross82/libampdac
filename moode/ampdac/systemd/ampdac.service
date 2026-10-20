@@ -1,0 +1,12 @@
+[Unit]
+Description=ampdac UAC2 userspace transport
+After=ampdac.socket
+Requires=ampdac.socket
+
+[Service]
+ExecStart=/usr/bin/ampdacd
+AmbientCapabilities=CAP_SYS_NICE CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_NICE CAP_SYS_ADMIN
+NoNewPrivileges=true
+Restart=on-failure
+TimeoutStopSec=5

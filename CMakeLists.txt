@@ -76,18 +76,6 @@ add_executable(ipc_smoke tests/ipc_smoke.c)
 target_link_libraries(ipc_smoke PRIVATE ampdac_client)
 target_include_directories(ipc_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_library(ddb_out_ampdac MODULE plugins/deadbeef/ampdac_output.c)
-set_target_properties(ddb_out_ampdac PROPERTIES
-    PREFIX ""
-    OUTPUT_NAME "ddb_out_ampdac"
-)
-target_include_directories(ddb_out_ampdac PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/plugins/deadbeef/include
-)
-target_compile_definitions(ddb_out_ampdac PRIVATE _GNU_SOURCE)
-target_link_libraries(ddb_out_ampdac PRIVATE ampdac_client)
-
 if(PkgConfig_FOUND)
     pkg_check_modules(ALSA alsa)
 endif()

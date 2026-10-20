@@ -1,0 +1,15 @@
+#!/bin/bash
+set -eu
+DEST=/data/plugins/miscellanea/ampdac
+
+# Upgrade replaces the tree from the new package. Removal is the only
+# path that should take the daemon, the route, and the UI patch back out.
+if [ "${1:-}" != "remove" ] && [ "${1:-}" != "purge" ]; then
+    exit 0
+fi
+
+if [ -f "$DEST/uninstall.sh" ]; then
+    bash "$DEST/uninstall.sh" || true
+fi
+rm -rf "$DEST"
+exit 0

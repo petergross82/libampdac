@@ -8,9 +8,6 @@ The files under native/ are that project's UAC2 engine (descriptor parser,
 clock control, ISO pool, DSD/DoP formatters, teardown). This repository does
 not include the Android app, JNI, FFmpeg decoder, or UI.
 
-Linux-specific work in this tree (ampdac C ABI, CLI, kernel unbind, Deadbeef
-output plugin, udev) is MIT, copyright petergross82, and lives beside those
+Linux-specific work in this tree (ampdac C ABI, CLI, kernel unbind, ALSA
+plugin, udev) is MIT, copyright petergross82, and lives beside those
 sources so the library can be built without the Android Gradle project.
-
-Deadbeef plugin headers under plugins/deadbeef/include/ are from DeaDBeeF
-1.10.3 (GPL-2.0) and are used only to compile the optional output plugin.
