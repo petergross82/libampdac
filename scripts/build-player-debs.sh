@@ -3,7 +3,7 @@
 # The Pi images do not compile. moOde is 64-bit only: that tree has no armhf build.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-version=0.3.19
+version=0.3.20
 debver=${version}-1
 mkdir -p "$root/dist"
 

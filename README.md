@@ -91,14 +91,14 @@ second player on top of it.
 
 ## Packages
 
-[v0.3.19](https://github.com/petergross82/libampdac/releases/tag/v0.3.19).
+[v0.3.20](https://github.com/petergross82/libampdac/releases/tag/v0.3.20).
 
 | Package | Where |
 | --- | --- |
-| `ampdac_0.3.19-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
-| `ampdac-volumio_0.3.19-1_armhf.deb` | Volumio 3, 32-bit Pi |
-| `ampdac-volumio_0.3.19-1_arm64.deb` | Volumio 3, 64-bit Pi |
-| `ampdac-moode_0.3.19-1_arm64.deb` | moOde 10.3.6, 64-bit only |
+| `ampdac_0.3.20-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
+| `ampdac-volumio_0.3.20-1_armhf.deb` | Volumio 3, 32-bit Pi |
+| `ampdac-volumio_0.3.20-1_arm64.deb` | Volumio 3, 64-bit Pi |
+| `ampdac-moode_0.3.20-1_arm64.deb` | moOde 10.3.6, 64-bit only |
 
 The Volumio package was installed with `dpkg` on a 32-bit Volumio 3 image.
 The moOde package runs the install script that was used on moOde 10.3.6.
@@ -108,7 +108,7 @@ is no 32-bit moOde build.
 ### Debian
 
 ```bash
-sudo apt install ./ampdac_0.3.19-1_amd64.deb
+sudo apt install ./ampdac_0.3.20-1_amd64.deb
 sudo usermod -aG audio "$USER"
 ```
 
@@ -144,7 +144,7 @@ Use the armhf package on a 32-bit image and the arm64 package on a 64-bit
 image. Installing restarts Volumio once, so the plugin process loads.
 
 ```bash
-sudo dpkg -i ampdac-volumio_0.3.19-1_armhf.deb
+sudo dpkg -i ampdac-volumio_0.3.20-1_armhf.deb
 ```
 
 Enable **ampdac** under Plugins → Installed plugins if it is off. Playback
@@ -175,7 +175,7 @@ units.
 64-bit only. Tested path: moOde 10.3.6.
 
 ```bash
-sudo dpkg -i ampdac-moode_0.3.19-1_arm64.deb
+sudo dpkg -i ampdac-moode_0.3.20-1_arm64.deb
 ```
 
 Configure → Audio → Output device lists the kernel DAC and

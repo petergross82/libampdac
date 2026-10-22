@@ -7,6 +7,7 @@ Manifest UI each keep a full copy of the app bundle; patch every copy
 that still has the installed-plugin row.
 """
 import pathlib
+import re
 import sys
 
 NAME_OLD = '{{plugin.prettyName}} <small ng-if="plugin.version"'
@@ -55,10 +56,17 @@ SELECT_PLAIN = (
     'ng-readonly="true" append-to-body="true" theme="bootstrap" '
     'on-select="item.id===\\\'output_device\\\' && pluginComponent.saveSection(section)">'
 )
-SELECT_NEW = (
+# Angular 1.5 rejects the comma operator. The parse error aborts ui-select,
+# the match stays empty, and the output row collapses to zero height.
+SELECT_COMMA = (
     '<ui-select id="{{item.id}}" ng-model="item.value" search-enabled="false" '
     'ng-readonly="true" append-to-body="true" theme="bootstrap" '
     'on-select="item.id===\\\'output_device\\\' && (item.value=$item, pluginComponent.saveSection(section))">'
+)
+SELECT_NEW = (
+    '<ui-select id="{{item.id}}" ng-model="item.value" search-enabled="false" '
+    'ng-readonly="true" append-to-body="true" theme="bootstrap" '
+    'on-select="item.id===\\\'output_device\\\' && (item.value=$item) && pluginComponent.saveSection(section)">'
 )
 
 ROOTS = (
@@ -91,7 +99,10 @@ def patch(text):
     if 'method:"showTransport"' not in text and METHOD_OLD in text:
         text = text.replace(METHOD_OLD, METHOD_NEW, 1)
         changed = True
-    if SELECT_PLAIN in text:
+    if SELECT_COMMA in text:
+        text = text.replace(SELECT_COMMA, SELECT_NEW)
+        changed = True
+    elif SELECT_PLAIN in text:
         text = text.replace(SELECT_PLAIN, SELECT_NEW)
         changed = True
     elif SELECT_BROKEN in text:
@@ -117,6 +128,9 @@ def unpatch(text):
     if SELECT_NEW in text:
         text = text.replace(SELECT_NEW, SELECT_OLD)
         changed = True
+    elif SELECT_COMMA in text:
+        text = text.replace(SELECT_COMMA, SELECT_OLD)
+        changed = True
     elif SELECT_PLAIN in text:
         text = text.replace(SELECT_PLAIN, SELECT_OLD)
         changed = True
@@ -126,12 +140,18 @@ def unpatch(text):
     return text, changed
 
 
+# Bump this when the patched bundle must be fetched again. A browser
+# that already loaded ?ampdac=1 keeps the broken select until the URL changes.
+CACHE_MARK = '?ampdac=2'
+CACHE_QUERY = re.compile(r'\?ampdac=\d+')
+
+
 def patch_index(path, remove):
     if not path.is_file():
         return False
     text = path.read_text(encoding='utf-8', errors='surrogateescape')
     if remove:
-        new = text.replace('?ampdac=1', '')
+        new = CACHE_QUERY.sub('', text)
     else:
         new = text
         token = 'scripts/app-'
@@ -144,13 +164,13 @@ def patch_index(path, remove):
             if j < 0:
                 break
             end = j + 3
-            # "?ampdac=1" is 9 characters. A 10-character slice also ate the
-            # following quote, so a second install stacked another copy.
-            mark = '?ampdac=1'
-            while new.startswith(mark, end):
-                new = new[:end] + new[end + len(mark):]
-            new = new[:end] + mark + new[end:]
-            start = end + len(mark)
+            while True:
+                query = CACHE_QUERY.match(new, end)
+                if query is None:
+                    break
+                new = new[:end] + new[query.end():]
+            new = new[:end] + CACHE_MARK + new[end:]
+            start = end + len(CACHE_MARK)
     if new == text:
         return False
     path.write_text(new, encoding='utf-8', errors='surrogateescape')
