@@ -187,31 +187,97 @@ PcmSourceEncoding source_encoding(ampdac_pcm_format format) {
     }
 }
 
-/**
- * SMSL advertises two 4-byte PCM alts: bBitResolution 32 and 24. 24-bit audio
- * with a zero padding byte on the 32-bit alt is what clicks; the 24-bit alt
- * is the one that knows those low bits are padding.
- */
-const Uac2StreamingEndpointInfo *prefer_pcm_bit_resolution(
-        const std::vector<Uac2StreamingEndpointInfo> &candidates,
-        uint8_t bit_resolution,
+/** bBitResolution, or the width implied by the slot when the DAC left it 0. */
+uint8_t declared_pcm_bits(const Uac2AsGeneralInfo &as) noexcept {
+    if (as.bit_resolution > 0U) return as.bit_resolution;
+    if (as.subslot_size == 2U) return 16;
+    if (as.subslot_size == 3U) return 24;
+    if (as.subslot_size == 4U) return 32;
+    return 0;
+}
+
+bool pcm_alt_can_carry(
+        const Uac2StreamingEndpointInfo &candidate,
         int channel_count,
-        int sample_rate_hz) {
+        int sample_rate_hz) noexcept {
+    const auto &as = candidate.as_general;
+    if (!as.is_present || as.format_type != UAC2_FORMAT_TYPE_I) return false;
+    if ((as.bm_formats & UAC_FORMAT_TYPE_I_PCM) == 0U) return false;
+    if (as.subslot_size != 2U && as.subslot_size != 3U && as.subslot_size != 4U) {
+        return false;
+    }
+    if (as.nr_channels != 0U &&
+        as.nr_channels != static_cast<uint8_t>(channel_count)) {
+        return false;
+    }
+    if (declared_pcm_bits(as) == 0U) return false;
     const uint32_t frames =
             (static_cast<uint32_t>(sample_rate_hz) + 7999U) / 8000U;
-    const uint32_t need = frames * 4U * static_cast<uint32_t>(channel_count);
-    const Uac2StreamingEndpointInfo *best = nullptr;
+    const uint32_t need = frames * as.subslot_size *
+            static_cast<uint32_t>(channel_count);
+    return candidate.effective_bytes_per_uframe >= need;
+}
+
+/** Lower is a better container for this declared width. */
+int pcm_slot_rank(uint8_t bits, uint8_t subslot) noexcept {
+    if (bits <= 16U) {
+        if (subslot == 2U) return 0;
+        if (subslot == 4U) return 1;
+        return 2;
+    }
+    if (bits <= 24U) {
+        if (subslot == 4U) return 0;
+        if (subslot == 3U) return 1;
+        return 2;
+    }
+    return subslot == 4U ? 0 : 1;
+}
+
+/**
+ * Smallest advertised PCM width that can hold the file.
+ * 32/24/16 → each file uses its own alt.
+ * 32 and 16 → 32- and 24-bit files use 32, 16-bit uses 16.
+ * 32 and 24 → 16- and 24-bit files use 24, 32-bit uses 32.
+ * One alt carries every PCM file. A packed 3-byte slot loses to a 4-byte
+ * slot of the same declared width.
+ */
+const Uac2StreamingEndpointInfo *select_pcm_alt(
+        const std::vector<Uac2StreamingEndpointInfo> &candidates,
+        uint8_t source_bits,
+        int channel_count,
+        int sample_rate_hz) {
+    uint8_t target = 0;
+    bool fits = false;
     for (const auto &candidate : candidates) {
-        const auto &as = candidate.as_general;
-        if (!as.is_present || as.format_type != UAC2_FORMAT_TYPE_I) continue;
-        if ((as.bm_formats & UAC_FORMAT_TYPE_I_PCM) == 0U) continue;
-        if (as.subslot_size != 4U || as.bit_resolution != bit_resolution) continue;
-        if (as.nr_channels != 0U &&
-            as.nr_channels != static_cast<uint8_t>(channel_count)) {
+        if (!pcm_alt_can_carry(candidate, channel_count, sample_rate_hz)) {
             continue;
         }
-        if (candidate.effective_bytes_per_uframe < need) continue;
-        if (best == nullptr || candidate.alt_setting < best->alt_setting) {
+        const uint8_t bits = declared_pcm_bits(candidate.as_general);
+        if (bits >= source_bits) {
+            if (!fits || bits < target) {
+                fits = true;
+                target = bits;
+            }
+        } else if (!fits && bits > target) {
+            target = bits;
+        }
+    }
+    if (target == 0U) return nullptr;
+
+    const Uac2StreamingEndpointInfo *best = nullptr;
+    for (const auto &candidate : candidates) {
+        if (!pcm_alt_can_carry(candidate, channel_count, sample_rate_hz)) {
+            continue;
+        }
+        if (declared_pcm_bits(candidate.as_general) != target) continue;
+        if (best == nullptr) {
+            best = &candidate;
+            continue;
+        }
+        const int rank = pcm_slot_rank(target, candidate.as_general.subslot_size);
+        const int best_rank = pcm_slot_rank(target, best->as_general.subslot_size);
+        if (rank < best_rank ||
+            (rank == best_rank && candidate.alt_setting < best->alt_setting)) {
             best = &candidate;
         }
     }
@@ -769,21 +835,21 @@ extern "C" ampdac_status ampdac_configure_pcm(
         return AMPDAC_ERR_UNSUPPORTED;
     }
 
-    // The normal path is a 4-byte Type-I subslot. 24-bit PCM uses the alt
-    // that advertises 24 valid bits. The 32-bit alt plays the zero padding
-    // byte as audio, and that is the click. DoP carrier rates stay on the
-    // 32-bit alt: that is the layout SMSL already locks to DSD on, and the
-    // marker still sits in the top byte. A packed 3-byte alt is used only
-    // when no 4-byte PCM alt matches this rate and channel count.
+    // Match the file to the narrowest PCM alt whose declared width can
+    // hold it. DoP disguised as PCM at the carrier rates stays on the
+    // 32-bit alt: that is the layout the marker already uses.
     const bool dop_carrier =
             config->sample_rate_hz == 176400U ||
             config->sample_rate_hz == 352800U ||
             config->sample_rate_hz == 705600U;
+    uint8_t source_bits = 32;
+    if (config->format == AMPDAC_PCM_S16LE) source_bits = 16;
+    else if (config->format == AMPDAC_PCM_S24_3LE) source_bits = 24;
     const Uac2StreamingEndpointInfo *selected = nullptr;
-    if (config->format == AMPDAC_PCM_S24_3LE && !dop_carrier) {
-        selected = prefer_pcm_bit_resolution(
+    if (!(dop_carrier && source_bits != 16U)) {
+        selected = select_pcm_alt(
                 candidates,
-                24,
+                source_bits,
                 static_cast<int>(config->channels),
                 static_cast<int>(config->sample_rate_hz));
     }
@@ -803,7 +869,7 @@ extern "C" ampdac_status ampdac_configure_pcm(
                 static_cast<int>(config->sample_rate_hz),
                 false);
     }
-    if (selected == nullptr || selected->as_general.subslot_size != 4U) {
+    if (selected == nullptr) {
         selected = prefer_packed_pcm24(
                 candidates,
                 static_cast<int>(config->channels),
@@ -811,7 +877,8 @@ extern "C" ampdac_status ampdac_configure_pcm(
     }
     if (selected == nullptr ||
         (selected->as_general.subslot_size != 4U &&
-         selected->as_general.subslot_size != 3U)) {
+         selected->as_general.subslot_size != 3U &&
+         selected->as_general.subslot_size != 2U)) {
         set_error("no matching UAC2 endpoint for requested PCM format");
         return AMPDAC_ERR_UNSUPPORTED;
     }
@@ -823,6 +890,7 @@ extern "C" ampdac_status ampdac_configure_pcm(
                 ? selected->as_general.bit_resolution
                 : static_cast<uint8_t>(subslot == 3U ? 24 : 32);
     if (subslot == 3U && valid_bits > 24U) valid_bits = 24;
+    if (subslot == 2U && valid_bits > 16U) valid_bits = 16;
     ctx->pcm_valid_bit_depth = valid_bits;
     ctx->pcm_wire_format = UsbPcmWireFormat{
             config->sample_rate_hz,

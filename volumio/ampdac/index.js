@@ -2,6 +2,7 @@
 
 var fs = require('fs');
 var exec = require('child_process').exec;
+var execSync = require('child_process').execSync;
 var libQ = null;
 try {
     libQ = require('/volumio/node_modules/kew');
@@ -265,6 +266,14 @@ function installHooks(self) {
         } else {
             this.setConfigParam({key: 'mixer', value: ''});
         }
+        try {
+            // Read the kernel mixer before Volumio's switch to mixer None
+            // writes 100% into it. live-off puts this level back.
+            execSync('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound remember-volume', {
+                timeout: 3000,
+                encoding: 'utf8'
+            });
+        } catch (e) {}
         try {
             this.setDeviceVolumeOverride({
                 card: 'ampdac',
@@ -566,6 +575,9 @@ function rememberCurrent(alsa) {
     }
     if (id === undefined || id === null || String(id) === '' ||
             String(id) === 'ampdac' || String(card) === 'ampdac') {
+        return;
+    }
+    if (builtinCard({id: id, name: name, alsacard: card})) {
         return;
     }
     exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound remember ' +

@@ -48,6 +48,14 @@ void write_s32le(uint8_t *destination, int32_t sample) noexcept
     destination[3] = static_cast<uint8_t>((bits >> 24U) & 0xFFU);
 }
 
+/** Top 16 bits of an MSB-aligned 32-bit sample, little-endian. */
+void write_top16(uint8_t *destination, int32_t sample) noexcept
+{
+    const auto bits = static_cast<uint32_t>(sample) >> 16U;
+    destination[0] = static_cast<uint8_t>(bits & 0xFFU);
+    destination[1] = static_cast<uint8_t>((bits >> 8U) & 0xFFU);
+}
+
 /** Top 24 bits of an MSB-aligned 32-bit sample, packed little-endian. */
 void write_packed24(uint8_t *destination, int32_t sample) noexcept
 {
@@ -58,6 +66,60 @@ void write_packed24(uint8_t *destination, int32_t sample) noexcept
 }
 
 } // namespace
+
+PcmFormatResult PcmWireFormatter::format_subslot2(
+        const uint8_t *input,
+        std::size_t input_bytes,
+        PcmSourceEncoding encoding,
+        double gain,
+        uint8_t *output,
+        std::size_t output_capacity) const noexcept
+{
+    std::size_t source_bytes = 4U;
+    if (encoding == PcmSourceEncoding::S16Le) source_bytes = 2U;
+    else if (encoding == PcmSourceEncoding::S24_3Le) source_bytes = 3U;
+    if (input_bytes % source_bytes != 0U) {
+        return {};
+    }
+
+    const std::size_t sample_count = input_bytes / source_bytes;
+    if (sample_count > output_capacity / 2U) {
+        return {};
+    }
+
+    const bool unity = gain == 1.0;
+    for (std::size_t index = 0; index < sample_count; ++index) {
+        int64_t wide_sample = 0;
+        if (encoding == PcmSourceEncoding::S16Le) {
+            const auto source = read_s16le(input + index * 2U);
+            if (unity) {
+                wide_sample = static_cast<int64_t>(source) * 65536LL;
+            } else {
+                wide_sample = std::llround(
+                        static_cast<double>(source) * gain * 65536.0);
+            }
+        } else if (encoding == PcmSourceEncoding::S24_3Le) {
+            const auto source = read_s24_3le(input + index * 3U);
+            if (unity) {
+                wide_sample = static_cast<int64_t>(source) * 256LL;
+            } else {
+                wide_sample = std::llround(
+                        static_cast<double>(source) * gain * 256.0);
+            }
+        } else {
+            const auto source = read_s32le(input + index * 4U);
+            wide_sample = unity
+                ? static_cast<int64_t>(source)
+                : std::llround(static_cast<double>(source) * gain);
+        }
+
+        write_top16(
+                output + index * 2U,
+                quantize_to_valid_bits(wide_sample));
+    }
+
+    return {sample_count * 2U, true};
+}
 
 PcmFormatResult PcmWireFormatter::format_subslot3(
         const uint8_t *input,
@@ -155,6 +217,10 @@ PcmFormatResult PcmWireFormatter::format(
         !std::isfinite(gain) || gain < 0.0 || gain > 1.0) {
         return {};
     }
+    if (format_.subslot_bytes == 2U) {
+        return format_subslot2(
+                input, input_bytes, encoding, gain, output, output_capacity);
+    }
     if (format_.subslot_bytes == 3U) {
         return format_subslot3(
                 input, input_bytes, encoding, gain, output, output_capacity);
@@ -217,6 +283,29 @@ PcmFormatResult PcmWireFormatter::format_float32(
     if (input == nullptr || output == nullptr || !format_.is_valid() ||
         !std::isfinite(gain) || gain < 0.0 || gain > 1.0) {
         return {};
+    }
+    if (format_.subslot_bytes == 2U) {
+        if (input_bytes % sizeof(float) != 0U) {
+            return {};
+        }
+        const std::size_t sample_count = input_bytes / sizeof(float);
+        if (sample_count > output_capacity / 2U) {
+            return {};
+        }
+        for (std::size_t index = 0; index < sample_count; ++index) {
+            float decoded = 0.0F;
+            std::memcpy(&decoded, input + index * sizeof(float), sizeof(decoded));
+            const double normalized = std::isfinite(decoded)
+                ? std::clamp(static_cast<double>(decoded) * gain, -1.0, 1.0)
+                : 0.0;
+            const double scaled = normalized >= 0.0
+                ? normalized * static_cast<double>(kInt32Max)
+                : normalized * -static_cast<double>(kInt32Min);
+            write_top16(
+                    output + index * 2U,
+                    quantize_to_valid_bits(std::llround(scaled)));
+        }
+        return {sample_count * 2U, true};
     }
     if (format_.subslot_bytes == 3U) {
         return format_float32_subslot3(

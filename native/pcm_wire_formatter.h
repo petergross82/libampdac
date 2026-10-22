@@ -78,6 +78,14 @@ public:
 private:
     [[nodiscard]] int32_t quantize_to_valid_bits(int64_t sample) const noexcept;
 
+    [[nodiscard]] PcmFormatResult format_subslot2(
+            const uint8_t *input,
+            std::size_t input_bytes,
+            PcmSourceEncoding encoding,
+            double gain,
+            uint8_t *output,
+            std::size_t output_capacity) const noexcept;
+
     [[nodiscard]] PcmFormatResult format_subslot3(
             const uint8_t *input,
             std::size_t input_bytes,

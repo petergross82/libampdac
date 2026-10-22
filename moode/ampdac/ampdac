@@ -158,6 +158,220 @@ note_bypass() {
     fi
 }
 
+list_alts() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "alts: python3 is missing"
+        return 0
+    fi
+    python3 - "$@" << 'PY'
+import os
+import sys
+
+SYS = "/sys/bus/usb/devices"
+RAW = 0x80000000
+NC = 0x1F
+
+
+def u32(b, off):
+    return int.from_bytes(b[off:off + 4], "little")
+
+
+def bytes_per_uframe(mps):
+    base = mps & 0x07FF
+    mult = (mps & 0x1800) >> 11
+    if mult > 2:
+        mult = 2
+    return base * (mult + 1)
+
+
+def native_dsd(alt):
+    if alt.get("type_iv") or alt.get("format_type") == 4:
+        return True
+    if alt.get("format_type") == 1:
+        bm = alt.get("bm_formats", 0)
+        if bm & RAW or bm == NC:
+            return True
+    return False
+
+
+def walk(blob):
+    found = []
+    cur = None
+
+    def flush():
+        nonlocal cur
+        if cur is None:
+            return
+        if cur.get("mps"):
+            found.append(cur)
+        cur = None
+
+    i = 0
+    n = len(blob)
+    while i + 1 < n:
+        ln = blob[i]
+        if ln < 2 or i + ln > n:
+            break
+        desc = blob[i:i + ln]
+        kind = desc[1]
+        if kind == 0x04 and ln >= 9:
+            flush()
+            number, alt, _eps, cls, sub, proto = desc[2], desc[3], desc[4], desc[5], desc[6], desc[7]
+            if cls == 0x01 and sub == 0x02 and proto == 0x20 and alt != 0:
+                cur = {
+                    "iface": number,
+                    "alt": alt,
+                    "channels": 0,
+                    "subslot": 0,
+                    "bits": 0,
+                    "format_type": 0,
+                    "bm_formats": 0,
+                    "type_iv": False,
+                    "present": False,
+                    "mps": 0,
+                }
+        elif cur is not None and kind == 0x24 and ln >= 3:
+            subtype = desc[2]
+            if subtype == 0x01 and ln >= 16:
+                cur["format_type"] = desc[5]
+                cur["bm_formats"] = u32(desc, 6)
+                cur["channels"] = desc[10]
+                cur["present"] = True
+            elif subtype == 0x02 and ln >= 4:
+                fmt = desc[3]
+                if fmt == 0x01 and ln >= 6:
+                    cur["subslot"] = desc[4]
+                    cur["bits"] = desc[5]
+                elif fmt == 0x04:
+                    cur["type_iv"] = True
+        elif cur is not None and kind == 0x05 and ln >= 7:
+            addr, attr = desc[2], desc[3]
+            if (addr & 0x80) == 0 and (attr & 0x03) == 1:
+                mps = int.from_bytes(desc[4:6], "little")
+                if mps & 0x07FF:
+                    cur["mps"] = mps
+        i += ln
+    flush()
+    uniq = []
+    seen = set()
+    for alt in found:
+        key = (alt["iface"], alt["alt"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(alt)
+    return uniq
+
+
+def open_alts(devdir):
+    opened = {}
+    try:
+        names = os.listdir(devdir)
+    except OSError:
+        return opened
+    for name in names:
+        path = os.path.join(devdir, name)
+        if not os.path.isdir(path):
+            continue
+        num_path = os.path.join(path, "bInterfaceNumber")
+        alt_path = os.path.join(path, "bAlternateSetting")
+        if not (os.path.isfile(num_path) and os.path.isfile(alt_path)):
+            continue
+        try:
+            num = int(open(num_path).read())
+            alt = int(open(alt_path).read())
+        except (OSError, ValueError):
+            continue
+        opened[num] = alt
+    return opened
+
+
+def line_for(alt, opened):
+    bpuf = bytes_per_uframe(alt["mps"])
+    mark = ""
+    if opened.get(alt["iface"]) == alt["alt"] and alt["alt"] != 0:
+        mark = "  open"
+    if native_dsd(alt):
+        ch = alt["channels"] or 0
+        return "  interface %u alt %u  native DSD  %u ch  %u bytes/uframe%s" % (
+            alt["iface"], alt["alt"], ch, bpuf, mark)
+    if alt["bits"] and alt["subslot"]:
+        return "  interface %u alt %u  PCM  %u bit  %u-byte slot  %u ch  %u bytes/uframe%s" % (
+            alt["iface"], alt["alt"], alt["bits"], alt["subslot"], alt["channels"], bpuf, mark)
+    return "  interface %u alt %u  PCM  %u ch  %u bytes/uframe%s" % (
+        alt["iface"], alt["alt"], alt["channels"], bpuf, mark)
+
+
+def render():
+    if not os.path.isdir(SYS):
+        return "alts: no UAC2 streaming interface"
+    blocks = []
+    for name in sorted(os.listdir(SYS)):
+        dev = os.path.join(SYS, name)
+        desc = os.path.join(dev, "descriptors")
+        if not os.path.isfile(desc):
+            continue
+        try:
+            blob = open(desc, "rb").read()
+        except OSError:
+            continue
+        alts = walk(blob)
+        if not alts:
+            continue
+        try:
+            vid = open(os.path.join(dev, "idVendor")).read().strip()
+            pid = open(os.path.join(dev, "idProduct")).read().strip()
+            product = open(os.path.join(dev, "product")).read().strip()
+        except OSError:
+            vid = pid = product = ""
+        opened = open_alts(dev)
+        lines = ["alts:"]
+        if product or vid:
+            who = product or "USB audio"
+            lines.append("  %s  %s:%s" % (who, vid, pid))
+        for alt in alts:
+            lines.append(line_for(alt, opened))
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return "alts: no UAC2 streaming interface"
+    return "\n\n".join(blocks)
+
+
+def splice(text, block):
+    if not text:
+        return block + "\n"
+    if "\nalts:" in "\n" + text or text.startswith("alts:"):
+        return text if text.endswith("\n") else text + "\n"
+    out = []
+    done = False
+    for raw in text.splitlines():
+        if not done and raw in ("transport: playing", "playback: idle"):
+            out.append(block)
+            out.append("")
+            done = True
+        out.append(raw)
+    if not done:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(block)
+    return "\n".join(out) + "\n"
+
+
+def main():
+    block = render()
+    if len(sys.argv) > 1 and sys.argv[1] == "--splice":
+        # The script itself arrives on stdin. The transport text is in the
+        # environment so the pipe does not replace this program.
+        sys.stdout.write(splice(os.environ.get("AMPDAC_TEXT", ""), block))
+        return
+    sys.stdout.write(block + "\n")
+
+
+if __name__ == "__main__":
+    main()
+PY
+}
+
 cmd_status() {
     local cards_file=/proc/asound/cards
     local asound=/etc/asound.conf
@@ -479,6 +693,10 @@ cmd_status() {
     fi
 
     echo
+    echo "=== alternates ==="
+    list_alts
+
+    echo
     if [ "$client_open" -eq 1 ]; then
         if [ -n "$client_name" ] && [ "$client_name" != "open" ]; then
             echo "summary: playing ampdac, client $client_name${client_pid:+ pid $client_pid}"
@@ -598,6 +816,7 @@ PY
 )" || rc=$?
 
     if [ "$rc" -eq 0 ]; then
+        text="$(AMPDAC_TEXT="$text" list_alts --splice)"
         local client_line=""
         if [ -n "$client_name" ] && [ "$client_name" != "open" ]; then
             client_line="client: $client_name${client_pid:+ pid $client_pid}"

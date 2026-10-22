@@ -31,8 +31,8 @@ struct ampdac_pcm {
     snd_pcm_uframes_t anchor_played;
     uint64_t anchor_ns;
     uint64_t stats_ns;
-    /* Wire bytes represented by one ALSA frame. S16 and packed S24 widen to
-     * a 4-byte subslot, and one DSD_U32 frame becomes two DoP frames. */
+    /* Wire bytes of one ALSA frame. The open alternate sets the slot width.
+     * One DSD_U32 frame becomes two DoP frames. */
     unsigned int wire_bpf;
     int clock_on;
     int started;
@@ -180,17 +180,16 @@ static int cb_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params) {
         return -EINVAL;
     }
     pcm->wire_bpf = frame_bytes(io);
-    if (io->format == SND_PCM_FORMAT_S16_LE) {
-        pcm->wire_bpf *= 2u;
-    } else if (io->format == SND_PCM_FORMAT_S24_3LE && pcm->wire_bpf > 0u) {
-        pcm->wire_bpf = (pcm->wire_bpf / 3u) * 4u;
-    }
     if (io->format != SND_PCM_FORMAT_DSD_U32_LE) {
         ampdac_negotiated neg;
         memset(&neg, 0, sizeof(neg));
         if (ampdac_client_negotiated_format(pcm->client, &neg) == AMPDAC_OK &&
-            neg.subslot_bytes == 3 && neg.channels > 0) {
-            pcm->wire_bpf = (unsigned int)neg.channels * 3u;
+            neg.subslot_bytes > 0 && neg.channels > 0) {
+            pcm->wire_bpf = (unsigned int)neg.channels * neg.subslot_bytes;
+        } else if (io->format == SND_PCM_FORMAT_S16_LE) {
+            pcm->wire_bpf *= 2u;
+        } else if (io->format == SND_PCM_FORMAT_S24_3LE && pcm->wire_bpf > 0u) {
+            pcm->wire_bpf = (pcm->wire_bpf / 3u) * 4u;
         }
     } else if (io->format == SND_PCM_FORMAT_DSD_U32_LE) {
         ampdac_negotiated neg;

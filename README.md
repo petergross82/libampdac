@@ -14,29 +14,35 @@ player. Android, JNI, and FFmpeg are not part of the transport.
 
 On a UAC2 DAC that publishes explicit feedback, the DAC crystal is the clock
 master. ampdacd counts the feedback endpoint and submits the next packets to
-match it. The file rate is not resampled. Gain on this path is unity, so a
-16-bit or 24-bit sample stays in the top of the USB slot and the padding bits
-stay zero.
+match it. The file rate is not resampled. Gain on this path is unity.
 
-When the DAC advertises both a 24-bit and a 32-bit 4-byte PCM alternate,
-24-bit PCM uses the 24-bit one. A packed 3-byte slot is used only when that
-rate and channel count have no 4-byte PCM alternate. Native DSD is used when
-the DAC advertises a raw DSD alternate. Otherwise DSD64, DSD128, and DSD256
-go out as DoP on a 4-byte PCM alternate. One client owns the DAC.
+PCM uses the narrowest alternate whose advertised width can hold the file.
+The DAC declares that width as `bBitResolution` on each PCM alternate.
 
-`ampdac show transport` prints the DAC descriptor, the live stream, the
-feedback clock, the ring, and losses. The source also prints which alternate
-is open and which alternates the DAC advertises. The ARM binaries inside the
-Volumio and moOde packages below were built before that text; a desktop build
-of this tree includes it.
+| Advertised PCM alternates | 16-bit file | 24-bit file | 32-bit file |
+| --- | --- | --- | --- |
+| 32, 24 and 16 | 16 | 24 | 32 |
+| 32 and 16, as on FiiO KA17 | 16 | 32 | 32 |
+| 32 and 24, as on SMSL with Thesycon firmware | 24 | 24 | 32 |
+| one alternate | that alternate | that alternate | that alternate |
+
+When the chosen slot is wider than the file, the sample stays in the top of
+the slot and the padding bits stay zero. A 16-bit file on the 16-bit
+alternate fills that slot; it is not padded out to 32. A packed 3-byte slot
+is used only when no 4-byte alternate of that width exists. Native DSD is
+used when the DAC advertises a raw DSD alternate. Otherwise DSD64, DSD128,
+and DSD256 go out as DoP on a 4-byte PCM alternate. One client owns the DAC.
+
+`ampdac show transport` prints the DAC descriptor, every advertised alternate,
+which alternate is open, the live stream, the feedback clock, the ring, and
+losses. `ampdac show status` prints the same alternate list.
 
 ~~~
 $ ampdac show transport
-DAC: SMSL USB AUDIO (152a:85dd)
+DAC: FIIO KA17
 ...
-stream: PCM 44100 Hz, 24 bit, stereo
-alternate: 2 (24-bit PCM)  ← libampdac
-kernel would open: 1 (S32_LE, 32-bit)
+stream: PCM 44100 Hz, 16 bit, stereo
+alt: interface 1, alt 2, 16 valid bits, 2-byte slot
 ~~~
 
 ## What we measured
@@ -66,7 +72,7 @@ could see. The clock trace was not.
 
 | File | Kernel on that DAC | libampdac |
 | --- | --- | --- |
-| 16-bit PCM, FiiO KA17 | 16-bit alternate | 32-bit alternate, sample in the top of the slot. KA17 has no 24-bit alternate |
+| 16-bit PCM, FiiO KA17 | 16-bit alternate | 16-bit alternate. Release 0.3.20 opened the 32-bit alternate and put the sample in the top of the slot |
 | 24-bit PCM, SMSL with Thesycon firmware | 32-bit alternate. ALSA has no 24-bit format on that card, so the padding byte is part of the slot | 24-bit alternate, when the DAC advertises one |
 | Same file on moOde, kernel entry | On the kernel path, moOde's MPD configuration resamples to 96 kHz by default. libampdac bypasses that: the file rate reaches the DAC unchanged | (no change; format stays the file width) |
 
@@ -110,14 +116,14 @@ second player on top of it.
 
 ## Packages
 
-[v0.3.20](https://github.com/petergross82/libampdac/releases/tag/v0.3.20).
+[v0.3.21](https://github.com/petergross82/libampdac/releases/tag/v0.3.21).
 
 | Package | Where |
 | --- | --- |
-| `ampdac_0.3.20-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
-| `ampdac-volumio_0.3.20-1_armhf.deb` | Volumio 3, 32-bit Pi |
-| `ampdac-volumio_0.3.20-1_arm64.deb` | Volumio 3, 64-bit Pi |
-| `ampdac-moode_0.3.20-1_arm64.deb` | moOde 10.3.6, 64-bit only |
+| `ampdac_0.3.21-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
+| `ampdac-volumio_0.3.21-1_armhf.deb` | Volumio 3, 32-bit Pi |
+| `ampdac-volumio_0.3.21-1_arm64.deb` | Volumio 3, 64-bit Pi |
+| `ampdac-moode_0.3.21-1_arm64.deb` | moOde 10.3.6, 64-bit only |
 
 The Volumio package was installed with `dpkg` on a 32-bit Volumio 3 image.
 The moOde package runs the install script that was used on moOde 10.3.6.
@@ -127,7 +133,7 @@ is no 32-bit moOde build.
 ### Debian
 
 ~~~
-sudo apt install ./ampdac_0.3.20-1_amd64.deb
+sudo apt install ./ampdac_0.3.21-1_amd64.deb
 sudo usermod -aG audio "$USER"
 ~~~
 
@@ -163,7 +169,7 @@ Use the armhf package on a 32-bit image and the arm64 package on a 64-bit
 image. Installing restarts Volumio once, so the plugin process loads.
 
 ~~~
-sudo dpkg -i ampdac-volumio_0.3.20-1_armhf.deb
+sudo dpkg -i ampdac-volumio_0.3.21-1_armhf.deb
 ~~~
 
 Enable **ampdac** under Plugins → Installed plugins if it is off. Playback
@@ -194,7 +200,7 @@ units.
 64-bit only. Tested path: moOde 10.3.6.
 
 ~~~
-sudo dpkg -i ampdac-moode_0.3.20-1_arm64.deb
+sudo dpkg -i ampdac-moode_0.3.21-1_arm64.deb
 ~~~
 
 Configure → Audio → Output device lists the kernel DAC and

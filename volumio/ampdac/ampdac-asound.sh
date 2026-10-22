@@ -331,6 +331,81 @@ kernel_card_visible() {
     '
 }
 
+# Card number of the USB DAC, once snd-usb-audio has it. Empty while
+# libampdac holds the device.
+kernel_usb_card() {
+    aplay -l 2>/dev/null | awk '
+        /card / {
+            line = tolower($0)
+            if (line ~ /hdmi/ || line ~ /bcm2835/ || line ~ /headphone/) next
+            n = $2
+            gsub(":", "", n)
+            print n
+            exit
+        }
+    '
+}
+
+playback_mixer() {
+    amixer -c "$1" scontents 2>/dev/null | awk '
+        index($0, "Simple mixer control") {
+            q1 = index($0, "'\''")
+            rest = substr($0, q1 + 1)
+            q2 = index(rest, "'\''")
+            name = ""
+            if (q2 > 1) name = substr(rest, 1, q2 - 1)
+            skip = (name ~ /Clock Validity|Tx Source|Internal Validity/)
+        }
+        name != "" && !skip && index($0, "Playback") && index($0, "%") {
+            print name
+            exit
+        }
+    '
+}
+
+# The kernel card comes up at the DAC default (KA17 reports 20%).
+# Volumio then reads that control and shows it. Keep the level the user
+# last had on this card and put it back when the control reappears.
+VOL=/var/lib/ampdac.volume
+
+save_kernel_volume() {
+    local card mixer vol
+    card="$(kernel_usb_card || true)"
+    [ -n "$card" ] || return 0
+    mixer="$(playback_mixer "$card" || true)"
+    [ -n "$mixer" ] || return 0
+    vol="$(amixer -M get -c "$card" "$mixer" 2>/dev/null | awk -F'[][]' '
+        index($0, "Playback") {
+            for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+%$/) {
+                gsub("%", "", $i)
+                print $i
+                exit
+            }
+        }
+    ')"
+    case "$vol" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    mkdir -p /var/lib
+    printf '%s\n' "$vol" > "$VOL"
+    chmod 644 "$VOL" || true
+}
+
+restore_kernel_volume() {
+    local card mixer vol
+    [ -f "$VOL" ] || return 0
+    vol="$(tr -cd '0-9' < "$VOL")"
+    [ -n "$vol" ] || return 0
+    card="$(kernel_usb_card || true)"
+    [ -n "$card" ] || return 0
+    mixer="$(playback_mixer "$card" || true)"
+    [ -n "$mixer" ] || return 0
+    amixer -M -q set -c "$card" "$mixer" "${vol}%" >/dev/null 2>&1 || true
+    if command -v volumio >/dev/null 2>&1; then
+        sudo -u volumio volumio volume "$vol" >/dev/null 2>&1 || true
+    fi
+}
+
 # Close the open PCM, then open whatever slave is in asound.conf now.
 # The flag and the file are already written by the caller. No mpd restart.
 reopen_output() {
@@ -344,6 +419,7 @@ reopen_output() {
         i=0
         while [ "$i" -lt 40 ]; do
             if kernel_card_visible; then
+                restore_kernel_volume || true
                 break
             fi
             i=$((i + 1))
@@ -367,8 +443,15 @@ reopen_output() {
 PREV=/var/lib/ampdac.previous
 
 remember_args() {
+    local id="$1" name="$2" card="$3"
+    # HDMI and Headphones stay in aplay while the USB DAC is claimed.
+    # Remembering them erases the DAC the output list has to keep showing.
+    [ -n "$id" ] || return 0
+    [ "$id" = "ampdac" ] && return 0
+    [ "$card" = "ampdac" ] && return 0
+    printf '%s %s %s\n' "$id" "$name" "$card" | grep -Eiq 'bcm2835|hdmi|headphone' && return 0
     mkdir -p /var/lib
-    printf '%s\t%s\t%s\n' "$1" "$2" "$3" > "$PREV"
+    printf '%s\t%s\t%s\n' "$id" "$name" "$card" > "$PREV"
     chmod 644 "$PREV" || true
 }
 
@@ -408,7 +491,13 @@ case "$MODE" in
         rm -f "$FLAG"
         echo off
         ;;
+    remember-volume)
+        save_kernel_volume
+        echo remember-volume
+        ;;
     live-on)
+        # The card is still bound here. Read it before MPD reopens ampdac.
+        save_kernel_volume || true
         mkdir -p /var/lib
         touch "$FLAG"
         if write_route; then
