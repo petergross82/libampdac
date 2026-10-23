@@ -765,4 +765,27 @@ ControllerAmpdac.prototype.getConfigurationFiles = function () {
     return ['config.json'];
 };
 
+// Volumio routes the mixer to this plugin while the output is ampdac.
+// A missing method comes back as undefined, and getcurrentVolume calls
+// .then on it, which exits the process and restarts the web UI.
+function unityVolume() {
+    return {
+        vol: 100,
+        mute: false,
+        disableVolumeControl: true
+    };
+}
+
+ControllerAmpdac.prototype.retrievevolume = function () {
+    return resolved(unityVolume());
+};
+
+ControllerAmpdac.prototype.alsavolume = function () {
+    return resolved(unityVolume());
+};
+
+ControllerAmpdac.prototype.updateVolumeSettings = function () {
+    return resolved(unityVolume());
+};
+
 module.exports = ControllerAmpdac;
