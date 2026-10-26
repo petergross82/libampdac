@@ -139,6 +139,119 @@ function setUsbIgnore(alsa, on) {
     } catch (e) {}
 }
 
+function readText(path) {
+    try {
+        return fs.readFileSync(path, 'utf8').replace(/\n$/, '').trim();
+    } catch (e) {
+        return '';
+    }
+}
+
+function descriptorsAreUac2(path) {
+    var blob;
+    try {
+        blob = fs.readFileSync(path);
+    } catch (e) {
+        return false;
+    }
+    var i = 0;
+    while (i + 9 <= blob.length) {
+        var length = blob[i];
+        if (length < 2 || i + length > blob.length) {
+            break;
+        }
+        if (blob[i + 1] === 4 && length >= 9 &&
+                blob[i + 5] === 1 && blob[i + 7] === 0x20) {
+            return true;
+        }
+        i += length;
+    }
+    return false;
+}
+
+/** Product string of the UAC2 device on the bus. Empty when it is unplugged. */
+function currentUsbDac() {
+    var root = '/sys/bus/usb/devices';
+    var names;
+    try {
+        names = fs.readdirSync(root);
+    } catch (e) {
+        return null;
+    }
+    var i;
+    for (i = 0; i < names.length; i++) {
+        if (names[i].charAt(0) === '.') {
+            continue;
+        }
+        var dir = root + '/' + names[i];
+        if (!descriptorsAreUac2(dir + '/descriptors')) {
+            continue;
+        }
+        var product = readText(dir + '/product');
+        var vid = readText(dir + '/idVendor').toLowerCase();
+        var pid = readText(dir + '/idProduct').toLowerCase();
+        if (!product || !vid || !pid) {
+            continue;
+        }
+        return {product: product, vid: vid, pid: pid};
+    }
+    return null;
+}
+
+function parseAlsaCards() {
+    var lines = readText('/proc/asound/cards').split('\n');
+    var cards = [];
+    var i;
+    for (i = 0; i < lines.length; i++) {
+        var match = lines[i].match(/^\s*(\d+)\s+\[([^\]]+)\]:\s+\S+\s+-\s+(.+)$/);
+        if (!match) {
+            continue;
+        }
+        cards.push({
+            id: match[1],
+            alsacard: match[2].trim(),
+            name: match[3].trim(),
+            usbid: readText('/proc/asound/card' + match[1] + '/usbid').toLowerCase()
+        });
+    }
+    return cards;
+}
+
+function findKernelUsbCard(usb) {
+    var cards = parseAlsaCards();
+    var want = usb ? (usb.vid + ':' + usb.pid) : '';
+    var i;
+    for (i = 0; i < cards.length; i++) {
+        if (!cards[i].usbid || builtinCard(cards[i])) {
+            continue;
+        }
+        if (want && cards[i].usbid !== want) {
+            continue;
+        }
+        /* A control interface alone is not a playback device. The card
+         * shows up in /proc/asound while the PCM node is still missing. */
+        try {
+            fs.accessSync('/dev/snd/pcmC' + cards[i].id + 'D0p');
+        } catch (e) {
+            continue;
+        }
+        return cards[i];
+    }
+    return null;
+}
+
+function waitForKernelUsbCard(usb, timeoutMs) {
+    var deadline = Date.now() + timeoutMs;
+    var card = findKernelUsbCard(usb);
+    while (!card && Date.now() < deadline) {
+        try {
+            execSync('/bin/sleep 0.1', {timeout: 1000});
+        } catch (e) {}
+        card = findKernelUsbCard(usb);
+    }
+    return card;
+}
+
 // Playback Options lists aplay -l cards. The plugin PCM is not a card, so
 // the web kept showing only the kernel DAC and MPD kept opening hw: via
 // pcm.volumio. Inject one card while this plugin is on.
@@ -181,24 +294,91 @@ function installHooks(self) {
         };
     }
 
+    if (typeof alsa.usbAudioAttach === 'function' && !alsa._ampdacAttachWrapped) {
+        alsa._ampdacOrigAttach = alsa.usbAudioAttach;
+        alsa.usbAudioAttach = function () {
+            /* Releasing libampdac makes the kernel card appear. That is not
+             * a DAC the user just plugged in, and Volumio's attach path
+             * would toast and start the track from the beginning. */
+            if (this._ampdacSuppressAttach) {
+                return;
+            }
+            return alsa._ampdacOrigAttach.apply(this, arguments);
+        };
+        alsa._ampdacAttachWrapped = true;
+    }
+
     if (typeof alsa.saveAlsaOptions === 'function') {
         alsa.saveAlsaOptions = function (data) {
+            if (this._ampdacSwitching) {
+                return this._ampdacSwitchPromise;
+            }
+            this._ampdacSwitching = true;
+            this._ampdacSuppressAttach = true;
             var state = null;
             try {
                 state = this.commandRouter.volumioGetState();
             } catch (e) {}
             this._ampdacWasPlaying = !!(state && state.status === 'play');
+            this._ampdacResumeMs = state && state.seek ? Number(state.seek) : 0;
             var incoming = data && data.output_device;
             var incomingId = incoming && (incoming.value !== undefined ? incoming.value : incoming.id);
             var previousId = '';
             try {
                 previousId = String(this.config.get('outputdevice') || '');
             } catch (e) {}
-            this._ampdacUserSwitch = String(incomingId) !== previousId;
+            var previousCard = '';
+            var previousName = '';
+            try {
+                previousCard = String(this.config.get('outputdevicecardname') || '');
+                previousName = String(this.config.get('outputdevicename') || '');
+            } catch (e) {}
+            var incomingCard = incoming && incoming.alsacard ? String(incoming.alsacard) : '';
+            var incomingName = incoming && incoming.label ? String(incoming.label) : '';
+            /* A new DAC often keeps the same card number. The ALSA id is
+             * what changed: KA17 and KA13 are both card 5. */
+            this._ampdacUserSwitch = String(incomingId) !== previousId ||
+                (incomingCard !== '' && incomingCard !== previousCard) ||
+                (incomingName !== '' && incomingName !== previousName &&
+                    String(incomingId) !== 'ampdac');
             if (String(incomingId) === 'ampdac') {
                 rememberCurrent(alsa);
+            } else if (ampdacSelected(this) && incoming &&
+                    !builtinCard({
+                        id: incomingId,
+                        name: incoming.label || '',
+                        alsacard: incoming.alsacard || ''
+                    })) {
+                /* Use the card already on the bus when it is visible.
+                 * Releasing the device here used to stop MPD, so the
+                 * track started over once the kernel card enumerated. */
+                var usbNow = currentUsbDac();
+                var appeared = findKernelUsbCard(usbNow);
+                if (appeared) {
+                    incoming.value = appeared.id;
+                    incoming.label = appeared.name;
+                    incoming.alsacard = appeared.alsacard;
+                    noteLiveDac(this, appeared);
+                }
             }
-            return alsa._ampdacOrigSave.apply(this, arguments);
+            var finished = alsa._ampdacOrigSave.apply(this, arguments);
+            this._ampdacSwitchPromise = finished;
+            var alsaSelf = this;
+            function unlockSwitch() {
+                setTimeout(function () {
+                    alsaSelf._ampdacSwitching = false;
+                    alsaSelf._ampdacSuppressAttach = false;
+                    if (!ampdacSelected(alsaSelf)) {
+                        setUsbIgnore(alsaSelf, false);
+                    }
+                }, 2000);
+            }
+            if (finished && typeof finished.then === 'function') {
+                finished.then(unlockSwitch, unlockSwitch);
+            } else {
+                unlockSwitch();
+            }
+            return finished;
         };
     }
 
@@ -223,12 +403,27 @@ function installHooks(self) {
             }
         }
         var remembered = rememberedCard();
+        var usb = currentUsbDac();
         if (live) {
             noteLiveDac(this, live);
+        } else if (usb && usb.product) {
+            var placeholder = {
+                id: 'usb',
+                alsacard: 'usb',
+                name: usb.product
+            };
+            if (remembered && String(remembered.name).trim() === usb.product) {
+                placeholder.id = remembered.id;
+                placeholder.alsacard = remembered.alsacard || remembered.id;
+            }
+            if (!listHasCard(cards, placeholder)) {
+                cards.push(placeholder);
+            }
         } else if (remembered && !listHasCard(cards, remembered)) {
             cards.push(remembered);
         }
-        var dacName = (live && live.name) || (remembered && remembered.name) || 'USB DAC';
+        var dacName = (live && live.name) || (usb && usb.product) ||
+            (remembered && remembered.name) || 'USB DAC';
         var pretty = 'libampdac · ' + dacName;
         rememberAmpdacLabel(this, pretty);
         if (hasAmp) {
@@ -298,7 +493,9 @@ function installHooks(self) {
         alsaSelf._ampdacWasPlaying = false;
         var desired = use ? 'ampdac' : 'kernel';
         var switched = alsaSelf._ampdacApplied !== undefined && alsaSelf._ampdacApplied !== desired;
-        setUsbIgnore(alsaSelf, use);
+        if (use) {
+            setUsbIgnore(alsaSelf, true);
+        }
         var d = libQ ? libQ.defer() : pending();
         // live-on writes the ampdac route and sets the flag before MPD
         // reopens. live-off clears the flag before the stock writer, so
@@ -386,7 +583,100 @@ function installHooks(self) {
     if (self.logger) {
         self.logger.info('ampdac: в списке выходов есть ядро и libampdac');
     }
+    watchUsbProduct(self);
     return true;
+}
+
+function followPluggedDac(alsa) {
+    if (!alsa || !alsa.config || typeof alsa.saveAlsaOptions !== 'function') {
+        return;
+    }
+    if (alsa._ampdacSwitching) {
+        return;
+    }
+    var usb = currentUsbDac();
+    if (!usb) {
+        return;
+    }
+    var selectedId = '';
+    var selectedCard = '';
+    try {
+        selectedId = String(alsa.config.get('outputdevice') || '');
+        selectedCard = String(alsa.config.get('outputdevicecardname') || '');
+    } catch (e) {
+        return;
+    }
+    if (selectedId === 'ampdac' || selectedCard === 'ampdac') {
+        return;
+    }
+    if (builtinCard({id: selectedId, name: '', alsacard: selectedCard})) {
+        return;
+    }
+    var live = findKernelUsbCard(usb);
+    if (!live) {
+        return;
+    }
+    if (String(live.id) === selectedId && String(live.alsacard) === selectedCard) {
+        return;
+    }
+    var key = String(live.id) + '/' + String(live.alsacard);
+    var now = Date.now();
+    if (alsa._ampdacFollowed === key && now - alsa._ampdacFollowedAt < 5000) {
+        return;
+    }
+    alsa._ampdacFollowed = key;
+    alsa._ampdacFollowedAt = now;
+    alsa.saveAlsaOptions({
+        disallowPush: true,
+        i2s: false,
+        output_device: {
+            value: live.id,
+            label: live.name,
+            alsacard: live.alsacard
+        }
+    });
+}
+
+function watchUsbProduct(self) {
+    if (self._ampdacUsbWatch) {
+        return;
+    }
+    self._ampdacSeenProduct = null;
+    self._ampdacUsbWatch = setInterval(function () {
+        var usb = currentUsbDac();
+        var product = usb ? usb.product : '';
+        var alsa = alsaController(self);
+        if (alsa) {
+            followPluggedDac(alsa);
+        }
+        if (self._ampdacSeenProduct === product) {
+            return;
+        }
+        var first = self._ampdacSeenProduct === null;
+        self._ampdacSeenProduct = product;
+        if (!alsa || typeof alsa.getAlsaCards !== 'function') {
+            return;
+        }
+        try {
+            alsa.getAlsaCards();
+        } catch (e) {}
+        if (!first && ampdacSelected(alsa)) {
+            exec('/usr/bin/sudo -n /usr/local/sbin/ampdac-asound reopen');
+        }
+        if (first || !self.commandRouter ||
+                typeof self.commandRouter.getUIConfigOnPlugin !== 'function') {
+            return;
+        }
+        var pendingConfig = self.commandRouter.getUIConfigOnPlugin(
+            'audio_interface', 'alsa_controller', {});
+        if (pendingConfig && typeof pendingConfig.then === 'function') {
+            pendingConfig.then(function (config) {
+                if (config) {
+                    self.commandRouter.broadcastMessage('pushUiConfig', config);
+                }
+            });
+        }
+    }, 2000);
 }
 
 function writeAmpdacAsound(logger, mode) {
@@ -546,6 +836,20 @@ function noteLiveDac(alsa, live) {
 }
 
 function resumePlayback(alsa) {
+    var seekMs = alsa && alsa._ampdacResumeMs ? Number(alsa._ampdacResumeMs) : 0;
+    try {
+        var sm = alsa.commandRouter && alsa.commandRouter.stateMachine;
+        /* A stopped state makes volumioPlay clear the queue and start the
+         * track at 0. The device swap already stopped MPD; keep the
+         * machine in pause so it resumes the same entry. The elapsed
+         * time was put back by ampdac-asound reopen. */
+        if (sm && sm.currentStatus === 'stop') {
+            sm.currentStatus = 'pause';
+            if (seekMs > 0) {
+                sm.currentSeek = seekMs;
+            }
+        }
+    } catch (e) {}
     try {
         if (alsa.commandRouter && typeof alsa.commandRouter.volumioPlay === 'function') {
             alsa.commandRouter.volumioPlay();
@@ -657,6 +961,10 @@ ControllerAmpdac.prototype.onStop = function () {
     if (self._ampdacHookTimer) {
         clearTimeout(self._ampdacHookTimer);
         self._ampdacHookTimer = null;
+    }
+    if (self._ampdacUsbWatch) {
+        clearInterval(self._ampdacUsbWatch);
+        self._ampdacUsbWatch = null;
     }
     unregisterMpdOutput(self);
     if (alsa && ampdacSelected(alsa)) {

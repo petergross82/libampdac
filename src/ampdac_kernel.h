@@ -21,6 +21,9 @@ struct AmpdacKernelClaim {
 
     std::vector<int> detached_ifaces;
     std::vector<UnboundIface> sysfs_unbound;
+    /** Sysfs name of the DAC, e.g. "1-1.1.2". Restore binds any audio
+     *  interface under it that is still without a driver. */
+    std::string sysname;
 };
 
 bool ampdac_kernel_takeover(libusb_device_handle *handle,

@@ -372,6 +372,42 @@ if __name__ == "__main__":
 PY
 }
 
+daemon_peek() {
+    python3 - << 'PY'
+import socket, struct, sys
+path = "/run/ampdac.sock"
+hdr = struct.pack("<IHHiI", 0x44504D41, 1, 10, 0, 0)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(8.0)
+try:
+    s.connect(path)
+    s.sendall(hdr)
+    buf = b""
+    while len(buf) < 16:
+        chunk = s.recv(16 - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    if len(buf) != 16:
+        sys.exit(1)
+    magic, ver, typ, status, length = struct.unpack("<IHHiI", buf)
+    body = b""
+    while len(body) < length:
+        chunk = s.recv(length - len(body))
+        if not chunk:
+            break
+        body += chunk
+except OSError:
+    sys.exit(1)
+if status == 0:
+    sys.stdout.buffer.write(body)
+    sys.exit(0)
+if status == -10:
+    sys.exit(2)
+sys.exit(1)
+PY
+}
+
 cmd_status() {
     local cards_file=/proc/asound/cards
     local asound=/etc/asound.conf
@@ -435,6 +471,23 @@ cmd_status() {
     if [ -z "$client_name" ] || [ "$client_name" = "open" ]; then
         detect_client
     fi
+
+    echo "=== dac ==="
+    if [ -S /run/ampdac.sock ] && command -v python3 >/dev/null 2>&1; then
+        local dac_text dac_rc=0
+        dac_text="$(daemon_peek)" || dac_rc=$?
+        if [ "$dac_rc" -eq 0 ]; then
+            printf '%s\n' "$dac_text" | awk '
+                /^(transport:|playback:)/ { exit }
+                { print }
+            '
+        else
+            echo "DAC: ampdacd did not answer"
+        fi
+    else
+        echo "DAC: ampdacd is not running"
+    fi
+    echo
 
     echo "=== open now ==="
     if [ -d /proc/asound ]; then
@@ -780,40 +833,7 @@ cmd_transport() {
     fi
 
     local text rc=0
-    text="$(python3 - << 'PY'
-import socket, struct, sys
-path = "/run/ampdac.sock"
-hdr = struct.pack("<IHHiI", 0x44504D41, 1, 10, 0, 0)
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(8.0)
-try:
-    s.connect(path)
-    s.sendall(hdr)
-    buf = b""
-    while len(buf) < 16:
-        chunk = s.recv(16 - len(buf))
-        if not chunk:
-            break
-        buf += chunk
-    if len(buf) != 16:
-        sys.exit(1)
-    magic, ver, typ, status, length = struct.unpack("<IHHiI", buf)
-    body = b""
-    while len(body) < length:
-        chunk = s.recv(length - len(body))
-        if not chunk:
-            break
-        body += chunk
-except OSError:
-    sys.exit(1)
-if status == 0:
-    sys.stdout.buffer.write(body)
-    sys.exit(0)
-if status == -10:
-    sys.exit(2)
-sys.exit(1)
-PY
-)" || rc=$?
+    text="$(daemon_peek)" || rc=$?
 
     if [ "$rc" -eq 0 ]; then
         text="$(AMPDAC_TEXT="$text" list_alts --splice)"

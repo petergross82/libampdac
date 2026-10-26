@@ -363,10 +363,14 @@ playback_mixer() {
     '
 }
 
-# The kernel card comes up at the DAC default (KA17 reports 20%).
-# Volumio then reads that control and shows it. Keep the level the user
-# last had on this card and put it back when the control reappears.
+# The kernel card comes up at the DAC default (KA17 reports 20%, KA13 at
+# 0 dB). Volumio then reads that control and shows it. Keep the level the
+# user last had on this card and put it back when the control reappears.
+# KA13's feature unit and this mixer are one control. The integer in
+# HWLEVEL is that level in 1/256 dB, so the transport does not keep a
+# second attenuation of its own.
 VOL=/var/lib/ampdac.volume
+HWLEVEL=/var/lib/ampdac.hwlevel
 
 save_kernel_volume() {
     local card mixer vol
@@ -374,6 +378,7 @@ save_kernel_volume() {
     [ -n "$card" ] || return 0
     mixer="$(playback_mixer "$card" || true)"
     [ -n "$mixer" ] || return 0
+    save_ka13_hwlevel "$card" "$mixer" || true
     vol="$(amixer -M get -c "$card" "$mixer" 2>/dev/null | awk -F'[][]' '
         index($0, "Playback") {
             for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+%$/) {
@@ -391,8 +396,55 @@ save_kernel_volume() {
     chmod 644 "$VOL" || true
 }
 
+# KA13 only. The dB shown by amixer is the feature-unit level.
+save_ka13_hwlevel() {
+    local card="$1" mixer="$2" usbid db level
+    usbid="$(tr -d ' \r\n' < "/proc/asound/card${card}/usbid" 2>/dev/null || true)"
+    [ "$usbid" = "2972:0062" ] || return 0
+    db="$(amixer -c "$card" sget "$mixer" 2>/dev/null | sed -n \
+        's/.*\[\(-\{0,1\}[0-9][0-9]*\.[0-9][0-9]*\)dB\].*/\1/p' | head -1)"
+    [ -n "$db" ] || return 0
+    level="$(awk -v d="$db" 'BEGIN { printf "%d\n", int(d * 256 + (d < 0 ? -0.5 : 0.5)) }')"
+    mkdir -p /var/lib
+    printf '%s\n' "$level" > "$HWLEVEL"
+    chmod 644 "$HWLEVEL" || true
+}
+
+# Returns 0 when this card is a KA13 and its level was applied here.
+# Other cards return 1 so the percent restore still runs.
+restore_ka13_level() {
+    local card usbid mixer level max raw
+    card="$(kernel_usb_card || true)"
+    [ -n "$card" ] || return 1
+    usbid="$(tr -d ' \r\n' < "/proc/asound/card${card}/usbid" 2>/dev/null || true)"
+    [ "$usbid" = "2972:0062" ] || return 1
+    [ -f "$HWLEVEL" ] || return 0
+    level="$(tr -cd '0-9-' < "$HWLEVEL")"
+    case "$level" in
+        ''|'-'|*[!0-9-]*) return 0 ;;
+    esac
+    mixer="$(playback_mixer "$card" || true)"
+    [ -n "$mixer" ] || return 0
+    max="$(amixer -c "$card" sget "$mixer" 2>/dev/null | awk '/Limits:/ { print $NF; exit }')"
+    case "$max" in
+        ''|*[!0-9]*) max=63 ;;
+    esac
+    raw=$((max + level / 256))
+    [ "$raw" -lt 0 ] && raw=0
+    [ "$raw" -gt "$max" ] && raw=$max
+    # The kernel card comes up unmuted at 0 dB. Mute before the level
+    # is written so that moment is not full scale.
+    amixer -q -c "$card" set "$mixer" mute >/dev/null 2>&1 || true
+    amixer -q -c "$card" set "$mixer" "$raw" >/dev/null 2>&1 || true
+    amixer -q -c "$card" set "$mixer" unmute >/dev/null 2>&1 || true
+    return 0
+}
+
 restore_kernel_volume() {
     local card mixer vol
+    if restore_ka13_level; then
+        return 0
+    fi
     [ -f "$VOL" ] || return 0
     vol="$(tr -cd '0-9' < "$VOL")"
     [ -n "$vol" ] || return 0
@@ -406,11 +458,62 @@ restore_kernel_volume() {
     fi
 }
 
+# MM:SS or H:MM:SS from `mpc status` into whole seconds.
+clock_to_seconds() {
+    local t="$1" a="" b="" c=""
+    [ -n "$t" ] || { echo 0; return; }
+    IFS=: read -r a b c <<EOF
+$t
+EOF
+    if [ -n "$c" ]; then
+        echo $((10#$a * 3600 + 10#$b * 60 + 10#$c))
+    elif [ -n "$b" ]; then
+        echo $((10#$a * 60 + 10#$b))
+    else
+        echo $((10#$a))
+    fi
+}
+
+# Disabling the only output stops MPD and zeros the elapsed time.
+# `seek SONGPOS SECONDS` still works in that stopped state, so the
+# following play continues the same queue entry instead of its start.
+remember_place() {
+    local line song clock
+    line="$(mpc status 2>/dev/null | sed -n 's/.*#\([0-9][0-9]*\)\/[0-9][0-9]*[[:space:]]\+\([0-9:][0-9:]*\)\/.*/\1 \2/p' | head -1 || true)"
+    song="${line%% *}"
+    clock="${line#* }"
+    if [ -z "$line" ] || [ -z "$song" ] || [ "$song" = "$clock" ]; then
+        PLACE_POS=""
+        PLACE_SEC=0
+        return
+    fi
+    PLACE_POS=$((song - 1))
+    PLACE_SEC="$(clock_to_seconds "$clock")"
+}
+
+restore_place() {
+    local reply
+    [ -n "${PLACE_POS:-}" ] || return 0
+    [ "${PLACE_SEC:-0}" -gt 0 ] || return 0
+    exec 8<>/dev/tcp/127.0.0.1/6600 || return 0
+    IFS= read -r -t 2 reply <&8 || true
+    printf 'seek %s %s\nclose\n' "$PLACE_POS" "$PLACE_SEC" >&8 || true
+    while IFS= read -r -t 2 reply <&8; do
+        case "$reply" in
+            OK*) break ;;
+            ACK*) printf '%s\n' "$reply" >&2; break ;;
+        esac
+    done || true
+    exec 8<&- || true
+    exec 8>&- || true
+}
+
 # Close the open PCM, then open whatever slave is in asound.conf now.
 # The flag and the file are already written by the caller. No mpd restart.
 reopen_output() {
     local id i
     id="$(mpd_alsa_output_id || true)"
+    remember_place
     mpc -q pause >/dev/null 2>&1 || true
     if [ -n "$id" ]; then
         mpc -q disable "$id" >/dev/null 2>&1 || true
@@ -437,6 +540,7 @@ reopen_output() {
             sleep 0.1
         done
     fi
+    restore_place
     echo reopened
 }
 
@@ -495,9 +599,21 @@ case "$MODE" in
         save_kernel_volume
         echo remember-volume
         ;;
+    apply-hwlevel)
+        dev="${2:-}"
+        case "$dev" in
+            controlC*)
+                n="${dev#controlC}"
+                id="$(tr -d ' \r\n' < "/proc/asound/card${n}/usbid" 2>/dev/null || true)"
+                [ "$id" = "2972:0062" ] || { echo apply-hwlevel; exit 0; }
+                ;;
+        esac
+        restore_ka13_level || true
+        echo apply-hwlevel
+        ;;
     live-on)
-        # The card is still bound here. Read it before MPD reopens ampdac.
-        save_kernel_volume || true
+        # remember-volume already stored the mixer. Reading it again here
+        # happens after Volumio has written 0 dB into the same control.
         mkdir -p /var/lib
         touch "$FLAG"
         if write_route; then

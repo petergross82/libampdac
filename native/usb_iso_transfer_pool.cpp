@@ -293,6 +293,18 @@ static void iso_feedback_callback(libusb_transfer *transfer)
         return;
     }
 
+    static std::atomic<int> feedback_logs{0};
+    if (feedback_logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        int pkt_status = -1;
+        int pkt_len = 0;
+        if (transfer->num_iso_packets > 0) {
+            pkt_status = static_cast<int>(transfer->iso_packet_desc[0].status);
+            pkt_len = static_cast<int>(transfer->iso_packet_desc[0].actual_length);
+        }
+        PLOGW("feedback IN status=%d packet=%d length=%d",
+              static_cast<int>(transfer->status), pkt_status, pkt_len);
+    }
+
     if (transfer->status == LIBUSB_TRANSFER_COMPLETED &&
         transfer->num_iso_packets > 0) {
         const auto &pkt = transfer->iso_packet_desc[0];
@@ -1271,6 +1283,11 @@ int IsoTransferPool::submit_feedback_transfers() noexcept
         return 0;
     }
     int submitted = 0;
+    if (audio_slot_count_ < transfers_.size() &&
+        transfers_[audio_slot_count_] != nullptr) {
+        (void)libusb_clear_halt(transfers_[audio_slot_count_]->dev_handle,
+                                cfg_.feedback_endpoint_address);
+    }
     for (std::size_t i = audio_slot_count_; i < transfers_.size(); ++i) {
         slots_[i].in_flight.store(true, std::memory_order_release);
         const int rc = libusb_submit_transfer(transfers_[i]);

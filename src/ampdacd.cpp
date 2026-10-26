@@ -11,6 +11,7 @@
 void uac2_volume_service_start();
 void uac2_volume_service_stop() noexcept;
 
+#include <dirent.h>
 #include <grp.h>
 #include <poll.h>
 #include <signal.h>
@@ -78,6 +79,316 @@ const char *dsd_name(uint32_t hz) {
 std::mutex g_dac_mu;
 std::string g_dac_header;
 bool g_dac_ok = false;
+
+struct DacId {
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    uint8_t bus = 0;
+    uint8_t address = 0;
+    bool known = false;
+};
+
+DacId g_dac_id;
+
+bool same_dac(const DacId &a, const DacId &b) {
+    return a.known && b.known && a.vid == b.vid && a.pid == b.pid &&
+            a.bus == b.bus && a.address == b.address;
+}
+
+bool read_file_u32(const char *path, int base, uint32_t *out) {
+    FILE *file = std::fopen(path, "r");
+    if (file == nullptr) return false;
+    unsigned long value = 0;
+    const char *fmt = base == 16 ? "%lx" : "%lu";
+    const bool ok = std::fscanf(file, fmt, &value) == 1;
+    std::fclose(file);
+    if (!ok) return false;
+    *out = static_cast<uint32_t>(value);
+    return true;
+}
+
+bool descriptors_are_uac2(const std::string &dir) {
+    const std::string path = dir + "/descriptors";
+    FILE *file = std::fopen(path.c_str(), "rb");
+    if (file == nullptr) return false;
+    unsigned char blob[4096];
+    const size_t n = std::fread(blob, 1, sizeof(blob), file);
+    std::fclose(file);
+    for (size_t i = 0; i + 9 <= n;) {
+        const unsigned length = blob[i];
+        if (length < 2 || i + length > n) break;
+        if (blob[i + 1] == 0x04 && length >= 9 &&
+            blob[i + 5] == 0x01 && blob[i + 6] == 0x02 && blob[i + 7] == 0x20) {
+            return true;
+        }
+        i += length;
+    }
+    return false;
+}
+
+std::string format_caps(const ampdac_capabilities &caps);
+
+/** First UAC2 device on the bus. Identity only: no control transfer. */
+DacId uac2_on_bus() {
+    DacId id;
+    DIR *dir = opendir("/sys/bus/usb/devices");
+    if (dir == nullptr) return id;
+    while (dirent *ent = readdir(dir)) {
+        if (ent->d_name[0] == '.') continue;
+        const std::string path = std::string("/sys/bus/usb/devices/") + ent->d_name;
+        if (!descriptors_are_uac2(path)) continue;
+        uint32_t vid = 0;
+        uint32_t pid = 0;
+        uint32_t bus = 0;
+        uint32_t address = 0;
+        if (!read_file_u32((path + "/idVendor").c_str(), 16, &vid) ||
+            !read_file_u32((path + "/idProduct").c_str(), 16, &pid) ||
+            !read_file_u32((path + "/busnum").c_str(), 10, &bus) ||
+            !read_file_u32((path + "/devnum").c_str(), 10, &address)) {
+            continue;
+        }
+        id.vid = static_cast<uint16_t>(vid);
+        id.pid = static_cast<uint16_t>(pid);
+        id.bus = static_cast<uint8_t>(bus);
+        id.address = static_cast<uint8_t>(address);
+        id.known = true;
+        break;
+    }
+    closedir(dir);
+    return id;
+}
+
+void remember_caps(const ampdac_capabilities &caps) {
+    g_dac_header = format_caps(caps);
+    g_dac_ok = true;
+    g_dac_id.vid = caps.device.vid;
+    g_dac_id.pid = caps.device.pid;
+    g_dac_id.bus = caps.device.bus;
+    g_dac_id.address = caps.device.address;
+    g_dac_id.known = true;
+}
+
+void read_sysfs_text(const std::string &path, char *dst, std::size_t dst_size) {
+    if (dst == nullptr || dst_size == 0) return;
+    dst[0] = '\0';
+    FILE *file = std::fopen(path.c_str(), "r");
+    if (file == nullptr) return;
+    if (std::fgets(dst, static_cast<int>(dst_size), file) == nullptr) {
+        dst[0] = '\0';
+    }
+    std::fclose(file);
+    std::size_t len = std::strlen(dst);
+    while (len > 0 && (dst[len - 1] == '\n' || dst[len - 1] == '\r')) {
+        dst[--len] = '\0';
+    }
+}
+
+/** Name, USB id and alternate settings from the cached descriptor.
+ *  No libusb claim, so a playing DAC keeps its volume. */
+bool caps_from_sysfs(const DacId &id, ampdac_capabilities *caps) {
+    if (caps == nullptr || !id.known) return false;
+    std::memset(caps, 0, sizeof(*caps));
+    DIR *dir = opendir("/sys/bus/usb/devices");
+    if (dir == nullptr) return false;
+    std::string devdir;
+    while (dirent *ent = readdir(dir)) {
+        if (ent->d_name[0] == '.') continue;
+        const std::string path = std::string("/sys/bus/usb/devices/") + ent->d_name;
+        if (!descriptors_are_uac2(path)) continue;
+        uint32_t vid = 0;
+        uint32_t pid = 0;
+        uint32_t bus = 0;
+        uint32_t address = 0;
+        if (!read_file_u32((path + "/idVendor").c_str(), 16, &vid) ||
+            !read_file_u32((path + "/idProduct").c_str(), 16, &pid) ||
+            !read_file_u32((path + "/busnum").c_str(), 10, &bus) ||
+            !read_file_u32((path + "/devnum").c_str(), 10, &address)) {
+            continue;
+        }
+        if (static_cast<uint16_t>(vid) != id.vid ||
+            static_cast<uint16_t>(pid) != id.pid ||
+            static_cast<uint8_t>(bus) != id.bus ||
+            static_cast<uint8_t>(address) != id.address) {
+            continue;
+        }
+        devdir = path;
+        break;
+    }
+    closedir(dir);
+    if (devdir.empty()) return false;
+
+    caps->device.vid = id.vid;
+    caps->device.pid = id.pid;
+    caps->device.bus = id.bus;
+    caps->device.address = id.address;
+    read_sysfs_text(devdir + "/manufacturer", caps->device.manufacturer,
+                    sizeof(caps->device.manufacturer));
+    read_sysfs_text(devdir + "/product", caps->device.product,
+                    sizeof(caps->device.product));
+    read_sysfs_text(devdir + "/serial", caps->device.serial,
+                    sizeof(caps->device.serial));
+
+    FILE *desc = std::fopen((devdir + "/descriptors").c_str(), "rb");
+    if (desc == nullptr) return true;
+    std::vector<unsigned char> blob(16384);
+    const std::size_t n = std::fread(blob.data(), 1, blob.size(), desc);
+    std::fclose(desc);
+
+    struct Alt {
+        bool live = false;
+        uint8_t iface = 0;
+        uint8_t alt = 0;
+        uint8_t channels = 0;
+        uint8_t format_type = 0;
+        uint32_t bm_formats = 0;
+        uint8_t subslot = 0;
+        uint8_t bits = 0;
+        bool type_iv = false;
+        uint16_t mps = 0;
+        uint8_t sync = 0;
+        uint8_t feedback_ep = 0;
+        bool implicit = false;
+    } cur;
+
+    auto finish = [&]() {
+        if (!cur.live || cur.mps == 0 || caps->alt_count >= AMPDAC_MAX_ALTS) {
+            cur = Alt{};
+            return;
+        }
+        const bool native = cur.type_iv || cur.format_type == 4 ||
+                (cur.format_type == 1 &&
+                 ((cur.bm_formats & 0x80000000u) != 0 || cur.bm_formats == 0x1Fu));
+        for (int seen = 0; seen < caps->alt_count; ++seen) {
+            if (caps->alts[seen].interface_number == cur.iface &&
+                caps->alts[seen].alt_setting == cur.alt) {
+                cur = Alt{};
+                return;
+            }
+        }
+        ampdac_alt_info &slot = caps->alts[caps->alt_count];
+        slot.interface_number = cur.iface;
+        slot.alt_setting = cur.alt;
+        slot.channels = cur.channels;
+        slot.subslot_bytes = native ? 0 : cur.subslot;
+        slot.valid_bits = native ? 0 : cur.bits;
+        slot.native_dsd = native ? 1U : 0U;
+        unsigned base = cur.mps & 0x07FFu;
+        unsigned mult = (cur.mps & 0x1800u) >> 11;
+        if (mult > 2) mult = 2;
+        slot.bytes_per_uframe = static_cast<uint16_t>(base * (mult + 1));
+        caps->alt_count++;
+        if (cur.channels > caps->channels_max) caps->channels_max = cur.channels;
+        if (!native && cur.bits > 0 && caps->bit_depth_count < AMPDAC_MAX_DEPTHS) {
+            bool seen = false;
+            for (int i = 0; i < caps->bit_depth_count; ++i) {
+                if (caps->bit_depths[i] == cur.bits) seen = true;
+            }
+            if (!seen) caps->bit_depths[caps->bit_depth_count++] = cur.bits;
+        }
+        if (native && caps->native_dsd == 0) {
+            caps->native_dsd = 1;
+            caps->native_dsd_interface = cur.iface;
+            caps->native_dsd_alt = cur.alt;
+        }
+        if (!native && caps->dop == 0 && (cur.bits >= 24 || cur.subslot >= 3)) {
+            caps->dop = 1;
+            caps->dop_pcm_alt = cur.alt;
+        }
+        if (caps->sync == AMPDAC_SYNC_NONE && cur.sync != 0) {
+            caps->sync = static_cast<ampdac_sync_mode>(cur.sync);
+        }
+        if (cur.feedback_ep != 0 && caps->feedback_endpoint == 0) {
+            caps->feedback = AMPDAC_FEEDBACK_EXPLICIT;
+            caps->feedback_endpoint = cur.feedback_ep;
+        } else if (cur.implicit && caps->feedback == AMPDAC_FEEDBACK_NONE) {
+            caps->feedback = AMPDAC_FEEDBACK_IMPLICIT;
+        }
+        cur = Alt{};
+    };
+
+    /* The descriptors file is the device descriptor plus every
+     * configuration. Walking all of them lists each alternate twice.
+     * Keep the configuration the device is using. */
+    uint32_t active_cfg = 1;
+    (void)read_file_u32((devdir + "/bConfigurationValue").c_str(), 10, &active_cfg);
+    std::size_t begin = 0;
+    std::size_t end = n;
+    if (n >= 2 && blob[1] == 0x01 && blob[0] >= 2 && blob[0] < n) {
+        begin = blob[0];
+    }
+    for (std::size_t cfg = begin; cfg + 9 <= n && blob[cfg + 1] == 0x02;) {
+        unsigned total = static_cast<unsigned>(blob[cfg + 2]) |
+                (static_cast<unsigned>(blob[cfg + 3]) << 8);
+        if (total < 9 || cfg + total > n) break;
+        if (blob[cfg + 5] == active_cfg) {
+            begin = cfg;
+            end = cfg + total;
+            break;
+        }
+        cfg += total;
+    }
+
+    for (std::size_t i = begin; i + 1 < end;) {
+        const unsigned len = blob[i];
+        if (len < 2 || i + len > end) break;
+        const unsigned char *d = blob.data() + i;
+        const unsigned kind = d[1];
+        if (kind == 0x04 && len >= 9) {
+            finish();
+            const unsigned cls = d[5];
+            const unsigned sub = d[6];
+            const unsigned proto = d[7];
+            if (cls == 0x01 && sub == 0x02 && proto == 0x20 && d[3] != 0) {
+                cur.live = true;
+                cur.iface = d[2];
+                cur.alt = d[3];
+            }
+        } else if (cur.live && kind == 0x24 && len >= 3) {
+            const unsigned subtype = d[2];
+            if (subtype == 0x01 && len >= 16) {
+                cur.format_type = d[5];
+                cur.bm_formats = static_cast<uint32_t>(d[6]) |
+                        (static_cast<uint32_t>(d[7]) << 8) |
+                        (static_cast<uint32_t>(d[8]) << 16) |
+                        (static_cast<uint32_t>(d[9]) << 24);
+                cur.channels = d[10];
+            } else if (subtype == 0x02 && len >= 4) {
+                if (d[3] == 0x01 && len >= 6) {
+                    cur.subslot = d[4];
+                    cur.bits = d[5];
+                } else if (d[3] == 0x04) {
+                    cur.type_iv = true;
+                }
+            }
+        } else if (cur.live && kind == 0x05 && len >= 7) {
+            const unsigned addr = d[2];
+            const unsigned attr = d[3];
+            const unsigned mps = static_cast<unsigned>(d[4]) |
+                    (static_cast<unsigned>(d[5]) << 8);
+            if ((attr & 0x03u) != 1u || (mps & 0x07FFu) == 0) {
+                i += len;
+                continue;
+            }
+            const unsigned usage = (attr >> 4) & 0x03u;
+            if ((addr & 0x80u) == 0 && (usage == 0 || usage == 2)) {
+                cur.mps = static_cast<uint16_t>(mps);
+                cur.sync = static_cast<uint8_t>((attr >> 2) & 0x03u);
+                if (usage == 2) cur.implicit = true;
+            } else if ((addr & 0x80u) != 0 && usage == 1) {
+                cur.feedback_ep = static_cast<uint8_t>(addr);
+            } else if (usage == 2) {
+                cur.implicit = true;
+            }
+        }
+        i += len;
+    }
+    finish();
+    if (caps->sample_rate_count == 0) {
+        std::snprintf(caps->notes, sizeof(caps->notes),
+                      "PCM rates are read when the DAC is not playing");
+    }
+    return true;
+}
 
 bool kernel_usb_playing() {
     for (int card = 0; card < 32; ++card) {
@@ -227,26 +538,46 @@ std::string format_caps(const ampdac_capabilities &caps) {
     return out;
 }
 
-std::string ensure_dac_header(bool playback_active) {
-    if (playback_active || kernel_usb_playing()) {
+std::string ensure_dac_header(bool playback_active, ampdac_session *session,
+                              bool open_device = false) {
+    /* Opening the DAC to refresh this text claims the control interface.
+     * On KA13 that puts the feature unit back to 0 dB. A different DAC is
+     * identified from the descriptor the kernel already cached. */
+    (void)session;
+    const DacId bus = uac2_on_bus();
+    if (!bus.known) {
         std::lock_guard<std::mutex> lock(g_dac_mu);
-        if (!g_dac_header.empty()) return g_dac_header;
-        return "DAC: descriptor not read while the kernel driver is playing\n";
+        g_dac_ok = false;
+        g_dac_id = DacId{};
+        g_dac_header = "DAC: no UAC2 device\n";
+        return g_dac_header;
     }
     {
         std::lock_guard<std::mutex> lock(g_dac_mu);
-        if (g_dac_ok && !g_dac_header.empty()) return g_dac_header;
+        if (g_dac_ok && same_dac(g_dac_id, bus)) return g_dac_header;
     }
-    ampdac_capabilities caps{};
-    const ampdac_status st = ampdac_probe(0, 0, &caps);
-    std::lock_guard<std::mutex> lock(g_dac_mu);
-    if (st != AMPDAC_OK) {
+
+    const bool playing = playback_active || kernel_usb_playing();
+    if (open_device && !playing) {
+        ampdac_capabilities probed{};
+        if (ampdac_probe(0, 0, &probed) == AMPDAC_OK &&
+            probed.device.vid == bus.vid && probed.device.pid == bus.pid) {
+            std::lock_guard<std::mutex> lock(g_dac_mu);
+            remember_caps(probed);
+            return g_dac_header;
+        }
+    }
+
+    ampdac_capabilities from_sys{};
+    if (!caps_from_sysfs(bus, &from_sys)) {
+        std::lock_guard<std::mutex> lock(g_dac_mu);
         g_dac_ok = false;
-        g_dac_header = std::string("DAC: no UAC2 device (") + ampdac_last_error() + ")\n";
+        g_dac_id = DacId{};
+        g_dac_header = "DAC: no UAC2 device\n";
         return g_dac_header;
     }
-    g_dac_header = format_caps(caps);
-    g_dac_ok = true;
+    std::lock_guard<std::mutex> lock(g_dac_mu);
+    remember_caps(from_sys);
     return g_dac_header;
 }
 
@@ -369,6 +700,7 @@ std::string format_transport(const ampdac_negotiated &n, const ampdac_stream_sta
 std::string peek_transport() {
     std::string stream;
     bool live = false;
+    std::string out;
     {
         std::lock_guard<std::mutex> lock(g_pub_mu);
         live = g_pub_session != nullptr && g_pub_started;
@@ -379,9 +711,11 @@ std::string peek_transport() {
                 ampdac_get_stats(g_pub_session, &stats) == AMPDAC_OK) {
                 stream = format_transport(neg, stats, g_pub_source_bits);
             }
+            /* Hold the publish lock so the session cannot close under describe. */
+            out = ensure_dac_header(true, g_pub_session);
         }
     }
-    std::string out = ensure_dac_header(live);
+    if (!live) out = ensure_dac_header(false, nullptr);
     if (!out.empty() && out.back() != '\n') out += '\n';
     out += "\n";
     if (stream.empty()) out += "playback: idle\n";
@@ -762,7 +1096,7 @@ int main(int argc, char **argv) {
     if (listen_fd < 0) return 1;
 
     uac2_volume_service_start();
-    (void)ensure_dac_header(false);
+    (void)ensure_dac_header(false, nullptr, true);
 
     while (!g_stop.load()) {
         struct pollfd pfds[2];

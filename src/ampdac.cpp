@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include <android/log.h>
+
 #include "libusb/libusb.h"
 
 #include "audio_gain.h"
@@ -424,6 +426,17 @@ ampdac_status program_usb_stream(
     }
     ctx->claimed_interface_number = claim.claimed_interface_number;
 
+    int early_ac = -1;
+    (void)uac2_find_clock_source_id(ctx->device_handle, &early_ac);
+    if (early_ac >= 0) {
+        if (libusb_claim_interface(ctx->device_handle, early_ac) == LIBUSB_SUCCESS) {
+            ctx->ctrl_interface_number = early_ac;
+        }
+    }
+    /* KA13 volume is a host feature-unit write. It is applied once the
+     * streaming alt is up and before any isochronous transfer is queued.
+     * A control transfer after that wedges dwc_otg's periodic schedule. */
+
     const auto idle_then_clock = [&](bool extra_settle) -> int {
         (void)uac2_apply_alt_setting(
                 ctx->device_handle,
@@ -515,6 +528,18 @@ ampdac_status program_usb_stream(
             return AMPDAC_ERR_CLOCK;
         }
         ctx->resolved_clock_source_id = static_cast<uint8_t>(winning_clock_id);
+    }
+    /* The streaming alt brings KA13 back to 0 dB. Write the level the
+     * buttons last chose, before any isochronous transfer. KA17, K7 and
+     * the SMSL keep their own knob and are not written. */
+    {
+        libusb_device_descriptor volume_desc{};
+        if (libusb_get_device_descriptor(libusb_get_device(ctx->device_handle),
+                                         &volume_desc) == LIBUSB_SUCCESS &&
+            volume_desc.idVendor == 0x2972U &&
+            volume_desc.idProduct == 0x0062U) {
+            uac2_volume_service_lock_full(ctx->device_handle);
+        }
     }
     if (settle_pll) {
         usleep(kDsdPllSettleUs);
@@ -1103,6 +1128,9 @@ extern "C" ampdac_status ampdac_start(ampdac_session *session) {
         set_error("usb_transport_prepare failed");
         return AMPDAC_ERR_IO;
     }
+    /* Feedback IN is already queued. The button read joins that same
+     * handle so dwc_otg keeps one periodic schedule. */
+    uac2_volume_service_arm_session_hid(session->ctx->device_handle);
     (void)session->ctx->playback_state.transition_to(UsbPlaybackState::Priming);
     session->started = true;
     return AMPDAC_OK;
@@ -1158,6 +1186,59 @@ extern "C" ampdac_status ampdac_drop(ampdac_session *session) {
     }
     session->ctx->transfer_pool->attach_ring_buffer(session->ctx->ring_buffer.get());
     return AMPDAC_OK;
+}
+
+void log_first_wire_peak(const uint8_t *payload, std::size_t bytes,
+                         std::size_t slot) {
+    static std::atomic<int> logged{0};
+    static std::atomic<int> silent_chunks{0};
+    if (logged.load(std::memory_order_relaxed) != 0 ||
+        payload == nullptr || slot == 0U || bytes < slot) {
+        return;
+    }
+    int32_t peak = 0;
+    const std::size_t samples = bytes / slot;
+    const std::size_t limit = samples > 4096U ? 4096U : samples;
+    for (std::size_t i = 0; i < limit; ++i) {
+        const uint8_t *p = payload + i * slot;
+        int32_t sample = 0;
+        if (slot == 2U) {
+            sample = static_cast<int16_t>(
+                    static_cast<uint16_t>(p[0]) |
+                    (static_cast<uint16_t>(p[1]) << 8));
+        } else if (slot == 3U) {
+            sample = static_cast<int32_t>(p[0] |
+                    (static_cast<uint32_t>(p[1]) << 8) |
+                    (static_cast<uint32_t>(p[2]) << 16));
+            if ((sample & 0x800000) != 0) sample |= ~0xFFFFFF;
+        } else {
+            sample = static_cast<int32_t>(
+                    static_cast<uint32_t>(p[0]) |
+                    (static_cast<uint32_t>(p[1]) << 8) |
+                    (static_cast<uint32_t>(p[2]) << 16) |
+                    (static_cast<uint32_t>(p[3]) << 24));
+        }
+        if (sample < 0) {
+            sample = sample == static_cast<int32_t>(0x80000000u)
+                    ? 0x7FFFFFFF
+                    : -sample;
+        }
+        if (sample > peak) peak = sample;
+    }
+    if (peak == 0 && silent_chunks.fetch_add(1, std::memory_order_relaxed) < 8) {
+        return;
+    }
+    if (logged.exchange(1, std::memory_order_relaxed) != 0) return;
+    char hex[48];
+    int pos = 0;
+    const int shown = bytes < 12U ? static_cast<int>(bytes) : 12;
+    for (int i = 0; i < shown && pos < static_cast<int>(sizeof(hex)) - 3; ++i) {
+        pos += std::snprintf(hex + pos, sizeof(hex) - static_cast<std::size_t>(pos),
+                             "%02X", payload[i]);
+    }
+    __android_log_print(ANDROID_LOG_INFO, "UsbAudioBridge",
+                        "wire peak %d slot %zu bytes %zu head %s",
+                        static_cast<int>(peak), slot, bytes, hex);
 }
 
 extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t bytes) {
@@ -1341,6 +1422,10 @@ extern "C" int ampdac_write(ampdac_session *session, const void *pcm, size_t byt
             input_offset += in_chunk;
             continue;
         }
+        log_first_wire_peak(
+                payload,
+                payload_bytes,
+                session->ctx->pcm_wire_format.subslot_bytes);
         const int pushed = push_wire_with_prefill(
                 session,
                 payload,
@@ -1372,8 +1457,9 @@ extern "C" ampdac_status ampdac_get_stats(
     return AMPDAC_OK;
 }
 
-static ampdac_status probe_open_session(ampdac_session *session,
-                                        ampdac_capabilities *out) {
+static ampdac_status fill_capabilities(ampdac_session *session,
+                                        ampdac_capabilities *out,
+                                        bool take_kernel) {
     if (session == nullptr || session->ctx == nullptr) {
         return AMPDAC_ERR_NO_DEVICE;
     }
@@ -1444,9 +1530,13 @@ static ampdac_status probe_open_session(ampdac_session *session,
     int ac = -1;
     const int clock_id = uac2_find_clock_source_id(handle, &ac);
     const int ctrl = ac >= 0 ? ac : 0;
-    std::string kernel_error;
-    (void)ampdac_kernel_takeover(handle, &session->kernel, &kernel_error);
-    (void)libusb_claim_interface(handle, ctrl);
+    if (take_kernel) {
+        std::string kernel_error;
+        (void)ampdac_kernel_takeover(handle, &session->kernel, &kernel_error);
+    }
+    /* A live session already holds this interface. Releasing it would drop
+     * the claim the stream is using. Release only a claim this call made. */
+    const int ctrl_claim = libusb_claim_interface(handle, ctrl);
     if (clock_id > 0) {
         out->sample_rate_count = uac2_query_clock_sample_rates(
                 handle,
@@ -1455,7 +1545,9 @@ static ampdac_status probe_open_session(ampdac_session *session,
                 out->sample_rates,
                 AMPDAC_MAX_RATES);
     }
-    libusb_release_interface(handle, ctrl);
+    if (ctrl_claim == LIBUSB_SUCCESS) {
+        libusb_release_interface(handle, ctrl);
+    }
 
     char dsd_note[96] = "";
     if (out->native_dsd != 0U && out->dop != 0U) {
@@ -1490,7 +1582,39 @@ static ampdac_status probe_open_session(ampdac_session *session,
                       static_cast<int>(out->sync), dsd_note);
     }
 
-    ampdac_close(session);
+    return AMPDAC_OK;
+}
+
+static ampdac_status probe_open_session(ampdac_session *session,
+                                        ampdac_capabilities *out) {
+    const ampdac_status st = fill_capabilities(session, out, true);
+    if (session != nullptr) ampdac_close(session);
+    return st;
+}
+
+extern "C" ampdac_status ampdac_describe(ampdac_session *session,
+                                         ampdac_capabilities *out) {
+    if (out == nullptr) return AMPDAC_ERR_INVALID;
+    return fill_capabilities(session, out, false);
+}
+
+extern "C" ampdac_status ampdac_session_device(const ampdac_session *session,
+                                               ampdac_device_info *out) {
+    if (session == nullptr || session->ctx == nullptr ||
+        session->ctx->device_handle == nullptr || out == nullptr) {
+        return AMPDAC_ERR_INVALID;
+    }
+    std::memset(out, 0, sizeof(*out));
+    libusb_device_handle *handle = session->ctx->device_handle;
+    libusb_device *dev = libusb_get_device(handle);
+    libusb_device_descriptor desc{};
+    if (libusb_get_device_descriptor(dev, &desc) != LIBUSB_SUCCESS) {
+        return AMPDAC_ERR_IO;
+    }
+    out->vid = desc.idVendor;
+    out->pid = desc.idProduct;
+    out->bus = libusb_get_bus_number(dev);
+    out->address = libusb_get_device_address(dev);
     return AMPDAC_OK;
 }
 

@@ -186,6 +186,16 @@ ampdac_status ampdac_probe_bus_address(uint8_t bus, uint8_t address,
                                        ampdac_capabilities *out);
 
 /**
+ * Describe an already-open session. Does not close it and does not release
+ * an audio-control claim the session already held.
+ */
+ampdac_status ampdac_describe(ampdac_session *session, ampdac_capabilities *out);
+
+/** USB identity of an open session. No clock request. */
+ampdac_status ampdac_session_device(const ampdac_session *session,
+                                    ampdac_device_info *out);
+
+/**
  * Open a UAC2 DAC. vid=0 and pid=0 selects the first UAC2 device found.
  * Detaches snd-usb-audio from the streaming interface when the kernel owns it.
  */

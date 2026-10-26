@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <sstream>
 #include <unistd.h>
@@ -62,11 +63,20 @@ bool sysfs_unbind(const std::string &iface_id, std::string *driver_out) {
 
 }  // namespace
 
+void bind_orphan_hid(const std::string &sysname);
+
 bool ampdac_kernel_takeover(libusb_device_handle *handle,
                             AmpdacKernelClaim *state,
                             std::string *error) {
     if (handle == nullptr || state == nullptr) return false;
+    /* A second call, from program_usb_stream after open, must not throw
+     * away the interfaces the first call detached. Close would then have
+     * nothing to bind, and the kernel card comes back without a PCM. */
+    AmpdacKernelClaim previous = *state;
     *state = AmpdacKernelClaim{};
+    state->detached_ifaces = std::move(previous.detached_ifaces);
+    state->sysfs_unbound = std::move(previous.sysfs_unbound);
+    state->sysname = previous.sysname;
 
     (void)libusb_set_auto_detach_kernel_driver(handle, 1);
 
@@ -78,13 +88,33 @@ bool ampdac_kernel_takeover(libusb_device_handle *handle,
     }
 
     const std::string sysname = usb_sysname(dev);
+    state->sysname = sysname;
+    /* Heal a HID interface left unbound by an earlier open before playback
+     * starts. Detaching it cancels usbhid's interrupt read inside dwc_otg
+     * and the periodic schedule, including explicit-feedback IN, stalls. */
+    bind_orphan_hid(sysname);
     const uint8_t config_value = cfg->bConfigurationValue;
     bool any_busy = false;
 
     for (int i = 0; i < cfg->bNumInterfaces; ++i) {
-        const int iface = cfg->interface[i].altsetting[0].bInterfaceNumber;
+        const libusb_interface_descriptor &alt0 = cfg->interface[i].altsetting[0];
+        const int iface = alt0.bInterfaceNumber;
+        /* HID (and any other non-audio interface) stays with its kernel
+         * driver. KA13 volume keys are ordinary input events from usbhid.
+         * Only the audio interfaces have to leave snd-usb-audio. */
+        if (alt0.bInterfaceClass != LIBUSB_CLASS_AUDIO) {
+            continue;
+        }
         const int active = libusb_kernel_driver_active(handle, iface);
         if (active == 0) continue;
+        bool already = false;
+        for (int held : state->detached_ifaces) {
+            if (held == iface) {
+                already = true;
+                break;
+            }
+        }
+        if (already) continue;
 
         int rc = libusb_detach_kernel_driver(handle, iface);
         if (rc == LIBUSB_SUCCESS) {
@@ -130,10 +160,44 @@ bool ampdac_kernel_takeover(libusb_device_handle *handle,
     return !any_busy;
 }
 
+void bind_orphan_driver(const std::string &sysname,
+                        const char *want_class,
+                        const char *driver) {
+    if (sysname.empty() || want_class == nullptr || driver == nullptr) return;
+    const std::string dir = "/sys/bus/usb/devices";
+    DIR *list = opendir(dir.c_str());
+    if (list == nullptr) return;
+    const std::string prefix = sysname + ":";
+    while (dirent *ent = readdir(list)) {
+        const std::string name = ent->d_name;
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string iface = dir + "/" + name;
+        if (access((iface + "/driver").c_str(), F_OK) == 0) continue;
+        std::ifstream klass_file(iface + "/bInterfaceClass");
+        std::string klass;
+        std::getline(klass_file, klass);
+        if (klass != want_class) continue;
+        (void)write_sysfs(std::string("/sys/bus/usb/drivers/") + driver + "/bind", name);
+    }
+    closedir(list);
+}
+
+void bind_orphan_audio(const std::string &sysname) {
+    bind_orphan_driver(sysname, "01", "snd-usb-audio");
+}
+
+/* A previous open detached usbhid and never bound it again. The buttons
+ * and the interrupt endpoint stay dead until something owns interface 0. */
+void bind_orphan_hid(const std::string &sysname) {
+    bind_orphan_driver(sysname, "03", "usbhid");
+}
+
 void ampdac_kernel_restore(const AmpdacKernelClaim &state) {
     for (const auto &u : state.sysfs_unbound) {
         if (u.driver.empty() || u.id.empty()) continue;
         const std::string path = "/sys/bus/usb/drivers/" + u.driver + "/bind";
         (void)write_sysfs(path, u.id);
     }
+    bind_orphan_audio(state.sysname);
+    bind_orphan_hid(state.sysname);
 }

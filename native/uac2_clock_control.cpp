@@ -336,19 +336,28 @@ int uac2_query_clock_sample_rates(
     }
 
     // UAC2 §5.2.1: RANGE layout is wNumSubRanges followed by (dMIN, dMAX, dRES)
-    // triplets. Eight subranges is more than any class-compliant DAC advertises.
-    unsigned char buf[2 + 8 * 12]{};
+    // triplets. XMOS and Thesycon publish ten discrete rates; 705.6 kHz and
+    // 768 kHz are the last two. A buffer of eight drops them. Some XMOS
+    // stacks return IO error when wLength is larger than their reply, so a
+    // failed wide read is retried at ten and then eight subranges.
+    unsigned char buf[2 + 16 * 12]{};
     const uint16_t index = static_cast<uint16_t>(
             (static_cast<uint16_t>(clock_source_id) << 8U) | control_interface);
-    const int n = libusb_control_transfer(
-            handle,
-            kDeviceToClassInterface,
-            kRequestGetRange,
-            kSampleFrequencyControl,
-            index,
-            buf,
-            static_cast<uint16_t>(sizeof(buf)),
-            kControlTimeoutMs);
+    const uint16_t lengths[] = {2 + 16 * 12, 2 + 10 * 12, 2 + 8 * 12};
+    int n = -1;
+    for (uint16_t len : lengths) {
+        n = libusb_control_transfer(
+                handle,
+                kDeviceToClassInterface,
+                kRequestGetRange,
+                kSampleFrequencyControl,
+                index,
+                buf,
+                len,
+                kControlTimeoutMs);
+        if (n >= 14) break;
+        if (n < 0) (void)libusb_clear_halt(handle, 0);
+    }
     if (n < 14) {
         CLKLOGW("uac2_query_clock_sample_rates: GET_RANGE failed (%d)", n);
         return 0;

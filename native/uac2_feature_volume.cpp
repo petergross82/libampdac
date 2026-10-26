@@ -8,12 +8,18 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <linux/input.h>
 
 #include "libusb/libusb.h"
 
@@ -24,6 +30,12 @@ static constexpr const char *VOL_TAG = "UsbAudioBridge";
 #define VLOGW(...) __android_log_print(ANDROID_LOG_WARN,  VOL_TAG, __VA_ARGS__)
 
 namespace {
+
+/** KA13 level in 1/256 dB, shared by the feature unit and the kernel mixer.
+ *  0 is full scale. The two paths must store this same number: adding a
+ *  step onto a stale copy makes the next driver quieter than the one
+ *  the listener just set. */
+std::atomic<int> g_ka13_level{-21 * 256};
 
 constexpr uint8_t kAudioClass = 0x01U;
 constexpr uint8_t kAudioControlSubclass = 0x01U;
@@ -47,7 +59,10 @@ constexpr uint32_t kUsageVolumeDec = (kConsumerPage << 16) | 0x00EAU;
 
 constexpr int kHoldDelayMs = 300;
 constexpr int kHoldRepeatMs = 80;
-constexpr int kInterruptTimeoutMs = 200;
+/* A timeout of 0 leaves the interrupt URB pending forever. On dwc_otg that
+ * stalls explicit-feedback IN (one completion every minute) and the DAC
+ * stays silent. One second still catches a press and lets ISO run. */
+constexpr unsigned int kHidIdleMs = 1000;
 
 struct FeatureVolume {
     int ac_interface = -1;
@@ -370,11 +385,16 @@ bool find_hid_volume(libusb_device_handle *handle, HidCandidate *out) {
         int n = read_hid_report_descriptor(handle, alt.bInterfaceNumber, desc, sizeof(desc));
         bool temporary_claim = false;
         if (n < 0) {
-            (void)libusb_set_auto_detach_kernel_driver(handle, 1);
+            /* Detach only this HID interface. auto-detach on the handle
+             * uses DISCONNECT_CLAIM, which fails when no driver is bound
+             * and would also be armed for the audio interfaces. */
+            (void)libusb_detach_kernel_driver(handle, alt.bInterfaceNumber);
             if (libusb_claim_interface(handle, alt.bInterfaceNumber) == LIBUSB_SUCCESS) {
                 temporary_claim = true;
                 n = read_hid_report_descriptor(
                         handle, alt.bInterfaceNumber, desc, sizeof(desc));
+            } else {
+                (void)libusb_attach_kernel_driver(handle, alt.bInterfaceNumber);
             }
         }
         Uac2HidVolumeReport report;
@@ -383,12 +403,14 @@ bool find_hid_volume(libusb_device_handle *handle, HidCandidate *out) {
         if (!useful) {
             if (temporary_claim) {
                 (void)libusb_release_interface(handle, alt.bInterfaceNumber);
+                (void)libusb_attach_kernel_driver(handle, alt.bInterfaceNumber);
             }
             continue;
         }
         if (!temporary_claim) {
-            (void)libusb_set_auto_detach_kernel_driver(handle, 1);
+            (void)libusb_detach_kernel_driver(handle, alt.bInterfaceNumber);
             if (libusb_claim_interface(handle, alt.bInterfaceNumber) != LIBUSB_SUCCESS) {
+                (void)libusb_attach_kernel_driver(handle, alt.bInterfaceNumber);
                 continue;
             }
         }
@@ -659,13 +681,17 @@ void apply_volume_step(libusb_device_handle *handle,
         volume->channel_count < 1) {
         return;
     }
-    int16_t current = 0;
+    int16_t current = volume->current;
     if (!get_s16(handle, volume->ac_interface, volume->unit_id, kCsVolume,
                  volume->channels[0], &current)) {
-        vol_note("volume GET_CUR failed");
-        return;
+        /* KA13 answers 0 dB after a control claim, and a failed read
+         * used to drop the press. Write the level the buttons already
+         * chose. */
+        vol_note("volume GET_CUR failed, writing remembered level");
+        current = volume->current;
+    } else {
+        volume->current = current;
     }
-    volume->current = current;
     const int32_t next32 = static_cast<int32_t>(current) +
             direction * static_cast<int32_t>(volume->step);
     int16_t next = static_cast<int16_t>(next32);
@@ -718,6 +744,377 @@ void apply_volume_step(libusb_device_handle *handle,
              static_cast<double>(next) / 256.0);
 }
 
+bool token_ok(const std::string &text, std::size_t limit) {
+    if (text.empty() || text.size() > limit) {
+        return false;
+    }
+    for (char c : text) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20U || c == '\'' || c == '\\' || c == ';') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool card_id_ok(const std::string &text) {
+    if (!token_ok(text, 32)) {
+        return false;
+    }
+    for (char c : text) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+constexpr const char *kHwLevelPath = "/var/lib/ampdac.hwlevel";
+
+void publish_level(int level) {
+    if (level > 0) {
+        level = 0;
+    }
+    if (level < -16128) {
+        level = -16128;
+    }
+    std::ofstream out(kHwLevelPath, std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    out << level << '\n';
+    out.close();
+    (void)chmod(kHwLevelPath, 0644);
+}
+
+int load_published_level(int fallback) {
+    std::ifstream in(kHwLevelPath);
+    int level = fallback;
+    if (!(in >> level)) {
+        return fallback;
+    }
+    if (level > 0) {
+        level = 0;
+    }
+    if (level < -16128) {
+        level = -16128;
+    }
+    return level;
+}
+
+/** Kernel card id and its playback mixer, while snd-usb-audio owns it. */
+bool locate_kernel_mixer(uint16_t vid, uint16_t pid,
+                         std::string *card_out, std::string *control_out) {
+    if (vid == 0 || card_out == nullptr || control_out == nullptr) {
+        return false;
+    }
+    char want[16];
+    std::snprintf(want, sizeof(want), "%04x:%04x", vid, pid);
+    std::string card;
+    for (int n = 0; n < 16; ++n) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/asound/card%d/usbid", n);
+        std::ifstream in(path);
+        std::string line;
+        if (!std::getline(in, line)) {
+            continue;
+        }
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line != want) {
+            continue;
+        }
+        std::snprintf(path, sizeof(path), "/dev/snd/pcmC%dD0p", n);
+        if (access(path, F_OK) != 0) {
+            return false;
+        }
+        std::snprintf(path, sizeof(path), "/proc/asound/card%d/id", n);
+        std::ifstream id_in(path);
+        if (!std::getline(id_in, card)) {
+            return false;
+        }
+        while (!card.empty() && (card.back() == '\r' || card.back() == ' ')) {
+            card.pop_back();
+        }
+        break;
+    }
+    if (!card_id_ok(card)) {
+        return false;
+    }
+
+    const std::string list_cmd = std::string("/usr/bin/amixer -c ") + card + " scontents";
+    FILE *pipe = popen(list_cmd.c_str(), "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+    std::string pending;
+    bool pending_volume = false;
+    std::string chosen;
+    char buf[256];
+    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+        const std::string line(buf);
+        const std::string prefix = "Simple mixer control '";
+        if (line.compare(0, prefix.size(), prefix) == 0) {
+            if (pending_volume && pending == "PCM") {
+                chosen = pending;
+                break;
+            }
+            if (pending_volume && chosen.empty()) {
+                chosen = pending;
+            }
+            const auto end = line.find('\'', prefix.size());
+            pending = end == std::string::npos
+                    ? std::string()
+                    : line.substr(prefix.size(), end - prefix.size());
+            pending_volume = false;
+            continue;
+        }
+        if (line.find("pvolume") != std::string::npos) {
+            pending_volume = true;
+        }
+    }
+    pclose(pipe);
+    if (pending_volume && pending == "PCM") {
+        chosen = pending;
+    } else if (pending_volume && chosen.empty()) {
+        chosen = pending;
+    }
+    if (!token_ok(chosen, 64)) {
+        return false;
+    }
+    *card_out = card;
+    *control_out = chosen;
+    return true;
+}
+
+/** Absolute feature-unit level currently shown by the kernel mixer. */
+bool read_kernel_level(uint16_t vid, uint16_t pid, int *level_out,
+                       int *raw_out, int *max_out) {
+    std::string card;
+    std::string control;
+    if (!locate_kernel_mixer(vid, pid, &card, &control)) {
+        return false;
+    }
+    char cmd[256];
+    std::snprintf(cmd, sizeof(cmd), "/usr/bin/amixer -c %s sget '%s'",
+                  card.c_str(), control.c_str());
+    FILE *pipe = popen(cmd, "r");
+    if (pipe == nullptr) {
+        return false;
+    }
+    bool have_level = false;
+    bool have_raw = false;
+    int level = 0;
+    int raw = 0;
+    int max_raw = 63;
+    char buf[256];
+    while (std::fgets(buf, sizeof(buf), pipe) != nullptr) {
+        const char *limits = std::strstr(buf, "Limits:");
+        int lo = 0;
+        int hi = 0;
+        if (limits != nullptr &&
+            std::sscanf(limits, "Limits: Playback %d - %d", &lo, &hi) == 2 &&
+            hi >= lo) {
+            max_raw = hi;
+        }
+        if (std::strstr(buf, "Playback") == nullptr) {
+            continue;
+        }
+        const char *play = std::strstr(buf, "Playback ");
+        int value = 0;
+        if (play != nullptr && std::sscanf(play, "Playback %d", &value) == 1) {
+            raw = value;
+            have_raw = true;
+        }
+        const char *db = std::strstr(buf, "dB]");
+        if (db == nullptr) {
+            continue;
+        }
+        const char *bracket = db;
+        while (bracket > buf && *bracket != '[') {
+            --bracket;
+        }
+        double db_value = 0;
+        if (*bracket == '[' && std::sscanf(bracket + 1, "%lf", &db_value) == 1) {
+            const double scaled = db_value * 256.0;
+            level = static_cast<int>(scaled + (scaled < 0 ? -0.5 : 0.5));
+            have_level = true;
+        }
+    }
+    pclose(pipe);
+    if (!have_level && have_raw) {
+        level = (raw - max_raw) * 256;
+        have_level = true;
+    }
+    if (!have_level) {
+        return false;
+    }
+    if (level_out != nullptr) {
+        *level_out = level;
+    }
+    if (raw_out != nullptr) {
+        *raw_out = raw;
+    }
+    if (max_out != nullptr) {
+        *max_out = max_raw;
+    }
+    return true;
+}
+
+/** Put the shared level into the kernel mixer. raw max is 0 dB. */
+bool write_kernel_level(uint16_t vid, uint16_t pid, int level) {
+    std::string card;
+    std::string control;
+    if (!locate_kernel_mixer(vid, pid, &card, &control)) {
+        return false;
+    }
+    int current = 0;
+    int raw = 0;
+    int max_raw = 63;
+    const bool known = read_kernel_level(vid, pid, &current, &raw, &max_raw);
+    if (!known || max_raw <= 0) {
+        max_raw = 63;
+    }
+    int next = max_raw + level / 256;
+    if (next < 0) {
+        next = 0;
+    }
+    if (next > max_raw) {
+        next = max_raw;
+    }
+    if (known && next == raw) {
+        return true;
+    }
+    char cmd[256];
+    std::snprintf(cmd, sizeof(cmd), "/usr/bin/amixer -q -c %s set '%s' mute",
+                  card.c_str(), control.c_str());
+    (void)std::system(cmd);
+    std::snprintf(cmd, sizeof(cmd), "/usr/bin/amixer -q -c %s set '%s' %d",
+                  card.c_str(), control.c_str(), next);
+    if (std::system(cmd) != 0) {
+        return false;
+    }
+    std::snprintf(cmd, sizeof(cmd), "/usr/bin/amixer -q -c %s set '%s' unmute",
+                  card.c_str(), control.c_str());
+    (void)std::system(cmd);
+    vol_note("kernel volume %d (%+.2f dB)",
+             level, static_cast<double>(level) / 256.0);
+    return true;
+}
+
+/** Step the kernel playback mixer of this USB device by one hardware tick. */
+bool step_kernel_mixer(uint16_t vid, uint16_t pid, int direction) {
+    if (vid == 0 || direction == 0) {
+        return false;
+    }
+    std::string card;
+    std::string control;
+    if (!locate_kernel_mixer(vid, pid, &card, &control)) {
+        return false;
+    }
+    char cmd[256];
+    std::snprintf(cmd, sizeof(cmd), "/usr/bin/amixer -q -c %s set '%s' %s",
+                  card.c_str(), control.c_str(), direction > 0 ? "1+" : "1-");
+    if (std::system(cmd) != 0) {
+        return false;
+    }
+    vol_note("hardware volume via %s %s %s",
+             card.c_str(), control.c_str(), direction > 0 ? "1+" : "1-");
+    return true;
+}
+
+bool kernel_card_present(uint16_t vid, uint16_t pid) {
+    if (vid == 0) {
+        return false;
+    }
+    char want[16];
+    std::snprintf(want, sizeof(want), "%04x:%04x", vid, pid);
+    for (int n = 0; n < 16; ++n) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/asound/card%d/usbid", n);
+        std::ifstream in(path);
+        std::string line;
+        if (!std::getline(in, line)) {
+            continue;
+        }
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line != want) {
+            continue;
+        }
+        std::snprintf(path, sizeof(path), "/dev/snd/pcmC%dD0p", n);
+        return access(path, F_OK) == 0;
+    }
+    return false;
+}
+
+/** One level on both drivers. A fresh kernel card comes up at 0 dB;
+ *  write the shared level, and write it again if that 0 dB comes back
+ *  during the switch. A card that was already up is read, not overwritten,
+ *  unless it is sitting at full scale over a quieter saved level. */
+void follow_kernel_card() {
+    constexpr uint16_t kVid = 0x2972;
+    constexpr uint16_t kPid = 0x0062;
+    static bool primed = false;
+    static bool up = false;
+    static std::chrono::steady_clock::time_point guard_until{};
+
+    const bool now = kernel_card_present(kVid, kPid);
+    const auto tick = std::chrono::steady_clock::now();
+    if (!primed) {
+        primed = true;
+        up = now;
+        if (!now) {
+            g_ka13_level.store(load_published_level(
+                    g_ka13_level.load(std::memory_order_relaxed)),
+                    std::memory_order_relaxed);
+            return;
+        }
+        int live = 0;
+        int raw = 0;
+        int max_raw = 0;
+        const int saved = load_published_level(
+                g_ka13_level.load(std::memory_order_relaxed));
+        if (read_kernel_level(kVid, kPid, &live, &raw, &max_raw) &&
+            max_raw > 0 && raw >= max_raw && saved < 0) {
+            g_ka13_level.store(saved, std::memory_order_relaxed);
+            (void)write_kernel_level(kVid, kPid, saved);
+            guard_until = tick + std::chrono::seconds(4);
+            return;
+        }
+        if (read_kernel_level(kVid, kPid, &live, &raw, &max_raw)) {
+            g_ka13_level.store(live, std::memory_order_relaxed);
+            publish_level(live);
+        }
+        return;
+    }
+    if (now && !up) {
+        const int level = load_published_level(
+                g_ka13_level.load(std::memory_order_relaxed));
+        g_ka13_level.store(level, std::memory_order_relaxed);
+        (void)write_kernel_level(kVid, kPid, level);
+        guard_until = tick + std::chrono::seconds(4);
+    }
+    if (!now) {
+        guard_until = {};
+    }
+    up = now;
+    if (now && tick < guard_until) {
+        int live = 0;
+        int raw = 0;
+        int max_raw = 0;
+        const int want = g_ka13_level.load(std::memory_order_relaxed);
+        if (read_kernel_level(kVid, kPid, &live, &raw, &max_raw) &&
+            max_raw > 0 && raw >= max_raw && want < 0) {
+            (void)write_kernel_level(kVid, kPid, want);
+        }
+    }
+}
+
 struct VolumeService {
     std::mutex mu;
     std::condition_variable cv;
@@ -735,6 +1132,13 @@ struct VolumeService {
     bool hid_ready = false;
     bool ac_ready = false;
     bool have_feature = false;
+    bool have_memory = false;
+    bool remembered_mute = false;
+    uint16_t device_vid = 0;
+    uint16_t device_pid = 0;
+    std::string key_dev;
+    std::string hid_dev;
+    uint8_t hid_bits = 0;
     bool mute_cleared = false;
     bool prev_up = false;
     bool prev_down = false;
@@ -743,6 +1147,215 @@ struct VolumeService {
     uint8_t last_report = 0xFF;
     std::chrono::steady_clock::time_point last_up{};
     std::chrono::steady_clock::time_point last_down{};
+
+    libusb_transfer *hid_xfer = nullptr;
+    uint8_t hid_buf[64]{};
+    int hid_completed = 0;
+    int hid_status = 0;
+    int hid_got = 0;
+    bool hid_armed = false;
+    bool hid_yielded = true;
+
+    libusb_device_handle *session_handle = nullptr;
+    libusb_transfer *session_xfer = nullptr;
+    int session_iface = -1;
+    bool session_claimed = false;
+    bool session_hid_released = true;
+    std::atomic<bool> session_hid_stop{false};
+    std::atomic<bool> session_hid_idle{true};
+    uint8_t session_buf[64]{};
+    uint8_t pending_report[64]{};
+    int pending_len = 0;
+    bool report_pending = false;
+
+    static void hid_transfer_done(libusb_transfer *xfer) {
+        auto *self = static_cast<VolumeService *>(xfer->user_data);
+        self->hid_status = xfer->status;
+        self->hid_got = xfer->actual_length;
+        self->hid_completed = 1;
+    }
+
+    bool arm_hid() {
+        if (own == nullptr) {
+            return false;
+        }
+        if (hid_xfer == nullptr) {
+            hid_xfer = libusb_alloc_transfer(0);
+            if (hid_xfer == nullptr) {
+                return false;
+            }
+        }
+        int packet = hid.packet_bytes;
+        if (packet < 1 || packet > static_cast<int>(sizeof(hid_buf))) {
+            packet = static_cast<int>(sizeof(hid_buf));
+        }
+        std::memset(hid_buf, 0, sizeof(hid_buf));
+        hid_completed = 0;
+        hid_status = 0;
+        hid_got = 0;
+        libusb_fill_interrupt_transfer(
+                hid_xfer,
+                own,
+                hid.endpoint,
+                hid_buf,
+                packet,
+                hid_transfer_done,
+                this,
+                kHidIdleMs);
+        const int rc = libusb_submit_transfer(hid_xfer);
+        if (rc != LIBUSB_SUCCESS) {
+            vol_note("volume HID submit failed (%s)", libusb_error_name(rc));
+            return false;
+        }
+        hid_armed = true;
+        return true;
+    }
+
+    static void session_hid_done(libusb_transfer *xfer) {
+        auto *self = static_cast<VolumeService *>(xfer->user_data);
+        const bool stopping = self->session_hid_stop.load(std::memory_order_acquire);
+        if (!stopping &&
+            xfer->status == LIBUSB_TRANSFER_COMPLETED &&
+            xfer->actual_length > 0) {
+            const int n = xfer->actual_length > static_cast<int>(sizeof(self->pending_report))
+                    ? static_cast<int>(sizeof(self->pending_report))
+                    : xfer->actual_length;
+            std::lock_guard<std::mutex> lock(self->mu);
+            std::memcpy(self->pending_report, xfer->buffer, static_cast<std::size_t>(n));
+            self->pending_len = n;
+            self->report_pending = true;
+            self->cv.notify_all();
+        }
+        if (stopping ||
+            xfer->status == LIBUSB_TRANSFER_CANCELLED ||
+            xfer->status == LIBUSB_TRANSFER_NO_DEVICE ||
+            xfer->status == LIBUSB_TRANSFER_ERROR ||
+            xfer->status == LIBUSB_TRANSFER_STALL) {
+            self->session_hid_idle.store(true, std::memory_order_release);
+            self->cv.notify_all();
+            return;
+        }
+        if (libusb_submit_transfer(xfer) != LIBUSB_SUCCESS) {
+            self->session_hid_idle.store(true, std::memory_order_release);
+            self->cv.notify_all();
+        }
+    }
+
+    /** Drop our own interrupt pipe and HID claim. Do not give the interface to usbhid. */
+    void yield_hid_claim() {
+        if (hid_armed && hid_xfer != nullptr && usb != nullptr && !hid_completed) {
+            (void)libusb_cancel_transfer(hid_xfer);
+            for (int i = 0; i < 40 && !hid_completed; ++i) {
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 20000;
+                (void)libusb_handle_events_timeout_completed(usb, &tv, &hid_completed);
+            }
+        }
+        hid_armed = false;
+        if (own != nullptr && hid_ready && hid.interface_number >= 0) {
+            (void)libusb_release_interface(own, hid.interface_number);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            hid_yielded = true;
+            session_hid_released = false;
+            cv.notify_all();
+        }
+        vol_note("volume HID yielded to the playback handle");
+    }
+
+    bool claim_session_interface(libusb_device_handle *handle) {
+        if (handle == nullptr || hid.endpoint == 0 || hid.interface_number < 0) {
+            std::lock_guard<std::mutex> lock(mu);
+            session_hid_released = true;
+            cv.notify_all();
+            return false;
+        }
+        (void)libusb_detach_kernel_driver(handle, hid.interface_number);
+        const int rc = libusb_claim_interface(handle, hid.interface_number);
+        if (rc != LIBUSB_SUCCESS) {
+            vol_note("session HID claim failed (%s)", libusb_error_name(rc));
+            std::lock_guard<std::mutex> lock(mu);
+            session_hid_released = true;
+            cv.notify_all();
+            return false;
+        }
+        session_handle = handle;
+        session_iface = hid.interface_number;
+        session_claimed = true;
+        vol_note("session HID iface %d claimed", hid.interface_number);
+        return true;
+    }
+
+    void arm_session_hid(libusb_device_handle *handle) {
+        if (!session_claimed || session_handle != handle || session_xfer != nullptr) {
+            return;
+        }
+        session_xfer = libusb_alloc_transfer(0);
+        if (session_xfer == nullptr) {
+            return;
+        }
+        int packet = hid.packet_bytes;
+        if (packet < 1 || packet > static_cast<int>(sizeof(session_buf))) {
+            packet = static_cast<int>(sizeof(session_buf));
+        }
+        std::memset(session_buf, 0, sizeof(session_buf));
+        session_hid_stop.store(false, std::memory_order_release);
+        session_hid_idle.store(false, std::memory_order_release);
+        libusb_fill_interrupt_transfer(
+                session_xfer,
+                handle,
+                hid.endpoint,
+                session_buf,
+                packet,
+                session_hid_done,
+                this,
+                kHidIdleMs);
+        const int rc = libusb_submit_transfer(session_xfer);
+        if (rc != LIBUSB_SUCCESS) {
+            session_hid_idle.store(true, std::memory_order_release);
+            libusb_free_transfer(session_xfer);
+            session_xfer = nullptr;
+            vol_note("session HID submit failed (%s)", libusb_error_name(rc));
+            return;
+        }
+        vol_note("session HID armed ep 0x%02X", hid.endpoint);
+    }
+
+    void reclaim_hid() {
+        if (own == nullptr || !hid_ready || hid.interface_number < 0) {
+            hid_yielded = false;
+            return;
+        }
+        (void)libusb_detach_kernel_driver(own, hid.interface_number);
+        if (libusb_claim_interface(own, hid.interface_number) != LIBUSB_SUCCESS) {
+            return;
+        }
+        hid_yielded = false;
+        (void)arm_hid();
+    }
+
+    void retire_hid() {
+        if (hid_armed && hid_xfer != nullptr && usb != nullptr && !hid_completed) {
+            (void)libusb_cancel_transfer(hid_xfer);
+            for (int i = 0; i < 40 && !hid_completed; ++i) {
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 50000;
+                (void)libusb_handle_events_timeout_completed(usb, &tv, &hid_completed);
+            }
+        }
+        /* libusb_close finishes a transfer that is still pending and runs
+         * its callback before returning. */
+        close_own();
+        if (hid_xfer != nullptr) {
+            libusb_free_transfer(hid_xfer);
+            hid_xfer = nullptr;
+        }
+        hid_armed = false;
+        hid_completed = 0;
+    }
 
     void close_own() {
         int ac = -1;
@@ -760,8 +1373,9 @@ struct VolumeService {
         if (own != nullptr && release_ac) {
             (void)libusb_release_interface(own, ac);
         }
-        if (own != nullptr && release_hid) {
+        if (own != nullptr && release_hid && !hid_yielded) {
             (void)libusb_release_interface(own, hid.interface_number);
+            (void)libusb_attach_kernel_driver(own, hid.interface_number);
         }
         if (own != nullptr) {
             libusb_close(own);
@@ -772,6 +1386,8 @@ struct VolumeService {
             usb = nullptr;
         }
         have_feature = false;
+        device_vid = 0;
+        device_pid = 0;
         cv.notify_all();
     }
 
@@ -823,7 +1439,6 @@ struct VolumeService {
             return false;
         }
         libusb_free_device_list(list, 1);
-        (void)libusb_set_auto_detach_kernel_driver(own, 1);
 
         HidCandidate found;
         if (!find_hid_volume(own, &found)) {
@@ -835,6 +1450,12 @@ struct VolumeService {
         }
         hid = found;
         hid_ready = true;
+        libusb_device_descriptor opened{};
+        if (libusb_get_device_descriptor(libusb_get_device(own), &opened) ==
+            LIBUSB_SUCCESS) {
+            device_vid = opened.idVendor;
+            device_pid = opened.idProduct;
+        }
         (void)libusb_control_transfer(
                 own,
                 kHostToClassInterface,
@@ -845,26 +1466,12 @@ struct VolumeService {
                 0,
                 kControlTimeoutMs);
 
+        /* Claiming the audio-control interface detaches snd-usb-audio.
+         * The kernel card then has no PCM and Volumio reports
+         * "No such file or directory". The knob uses the playback handle
+         * while libampdac is open, and the ALSA mixer while the kernel is. */
         const int ac = audio_control_interface(libusb_get_device(own));
         feature.ac_interface = ac;
-        bool want_ac = false;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            want_ac = !external_ac && ac >= 0;
-        }
-        if (want_ac) {
-            const int rc = libusb_claim_interface(own, ac);
-            std::lock_guard<std::mutex> lock(mu);
-            if (rc == LIBUSB_SUCCESS && external_ac) {
-                (void)libusb_release_interface(own, ac);
-                ac_ready = false;
-                cv.notify_all();
-            } else if (rc == LIBUSB_SUCCESS) {
-                ac_ready = true;
-            } else {
-                vol_note("volume service AC claim failed (%s)", libusb_error_name(rc));
-            }
-        }
 
         libusb_device_handle *probe = nullptr;
         int probe_ac = ac;
@@ -895,6 +1502,11 @@ struct VolumeService {
                          static_cast<int>(feature.current),
                          static_cast<double>(feature.current) / 256.0);
             }
+        }
+        if (!have_feature) {
+            vol_note("volume service HID iface %d ep 0x%02X",
+                     hid.interface_number,
+                     hid.endpoint);
         }
         return true;
     }
@@ -979,68 +1591,293 @@ struct VolumeService {
                 }
             }
         }
-        if (direction == 0 || !have_feature) {
+        if (direction == 0) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mu);
-        libusb_device_handle *handle = nullptr;
-        if (audio != nullptr) {
-            handle = audio;
-            feature.ac_interface = audio_ac;
-        } else if (ac_ready && own != nullptr) {
-            handle = own;
+        apply_direction(direction);
+    }
+
+    /* A replaced /dev node keeps the old file descriptor open and silent.
+     * stat() failing means the path we opened is gone; that must reopen
+     * too, otherwise the next press is discarded. */
+    static bool node_is_stale(int fd, const std::string &path) {
+        if (fd < 0) {
+            return false;
         }
-        if (handle != nullptr) {
-            apply_volume_step(handle, &feature, direction, &mute_cleared);
+        struct stat held {};
+        if (::fstat(fd, &held) != 0 || held.st_nlink == 0) {
+            return true;
+        }
+        if (path.empty()) {
+            return true;
+        }
+        struct stat live {};
+        if (::stat(path.c_str(), &live) != 0) {
+            return true;
+        }
+        return live.st_ino != held.st_ino;
+    }
+
+    void apply_direction(int direction) {
+        if (direction == 0) {
+            return;
+        }
+        uint16_t vid = 0;
+        uint16_t pid = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            vid = device_vid;
+            pid = device_pid;
+            /* While libusb owns the DAC the kernel mixer is not the
+             * signal path. A press has to move the feature unit. */
+            if (audio != nullptr) {
+                if (!have_feature) {
+                    FeatureVolume parsed;
+                    if (!find_feature_volume(audio, audio_ac, &parsed) ||
+                        !load_range_and_current(audio, &parsed)) {
+                        vol_note("volume button ignored, feature unit unread");
+                        return;
+                    }
+                    feature = parsed;
+                    feature.ac_interface = audio_ac;
+                    have_feature = true;
+                }
+                feature.ac_interface = audio_ac;
+                apply_volume_step(audio, &feature, direction, &mute_cleared);
+                note_feature_level(feature);
+                return;
+            }
+        }
+        if (step_kernel_mixer(vid, pid, direction)) {
+            int level = 0;
+            int raw = 0;
+            int max_raw = 0;
+            if (read_kernel_level(vid, pid, &level, &raw, &max_raw)) {
+                if (level > 0) level = 0;
+                if (level < -16128) level = -16128;
+                g_ka13_level.store(level, std::memory_order_relaxed);
+                publish_level(level);
+            }
+        }
+    }
+
+    void note_feature_level(const FeatureVolume &feature) {
+        g_ka13_level.store(feature.current, std::memory_order_relaxed);
+        publish_level(feature.current);
+    }
+
+    int open_ka13_keys() {
+        int chosen = -1;
+        for (int n = 0; n < 32; ++n) {
+            char path[80];
+            std::snprintf(path, sizeof(path),
+                          "/sys/class/input/event%d/device/id/vendor", n);
+            std::ifstream vendor_in(path);
+            std::string vendor;
+            if (!std::getline(vendor_in, vendor) || vendor != "2972") {
+                continue;
+            }
+            std::snprintf(path, sizeof(path),
+                          "/sys/class/input/event%d/device/id/product", n);
+            std::ifstream product_in(path);
+            std::string product;
+            if (!std::getline(product_in, product) || product != "0062") {
+                continue;
+            }
+            std::snprintf(path, sizeof(path), "/dev/input/event%d", n);
+            const int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+            if (fd < 0) {
+                continue;
+            }
+            if (chosen >= 0) {
+                ::close(chosen);
+            }
+            chosen = fd;
+            key_dev = path;
+            std::snprintf(path, sizeof(path),
+                          "/sys/class/input/event%d/device/name", n);
+            std::ifstream name_in(path);
+            std::string name;
+            std::getline(name_in, name);
+            if (name.find("Consumer") != std::string::npos) {
+                break;
+            }
+        }
+        if (chosen >= 0) {
+            std::lock_guard<std::mutex> lock(mu);
+            device_vid = 0x2972;
+            device_pid = 0x0062;
+        }
+        return chosen;
+    }
+
+    /* usbhid publishes the same interrupt reports here. The input node
+     * stays silent when the kernel does not map the report onto a key. */
+    int open_ka13_hidraw() {
+        for (int n = 0; n < 16; ++n) {
+            char path[80];
+            std::snprintf(path, sizeof(path), "/sys/class/hidraw/hidraw%d/device", n);
+            char link[256];
+            const ssize_t got = ::readlink(path, link, sizeof(link) - 1);
+            if (got <= 0) {
+                continue;
+            }
+            link[got] = '\0';
+            if (std::strstr(link, "2972:0062") == nullptr) {
+                continue;
+            }
+            std::snprintf(path, sizeof(path), "/dev/hidraw%d", n);
+            const int fd = ::open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+            if (fd >= 0) {
+                hid_dev = path;
+                vol_note("KA13 volume keys follow %s", path);
+                return fd;
+            }
+        }
+        return -1;
+    }
+
+    void on_hid_report(const uint8_t *buf, int length) {
+        if (buf == nullptr || length < 1) {
+            return;
+        }
+        uint8_t bits = buf[0];
+        if ((bits & 0x06U) == 0 && length > 1 && (buf[1] & 0x06U) != 0) {
+            bits = buf[1];
+        }
+        const uint8_t changed = static_cast<uint8_t>(bits ^ hid_bits);
+        hid_bits = bits;
+        if ((changed & 0x02U) != 0 && (bits & 0x02U) != 0) {
+            vol_note("hid volume up");
+            apply_direction(+1);
+        }
+        if ((changed & 0x04U) != 0 && (bits & 0x04U) != 0) {
+            vol_note("hid volume down");
+            apply_direction(-1);
         }
     }
 
     void run() {
+        /* KA13 volume buttons are ordinary consumer keys. usbhid owns
+         * the HID interface; claiming it from here detaches that driver
+         * and stalls isochronous feedback on this host. KA17, K7 and the
+         * SMSL apply their own knobs and are left alone. */
+        int fd = -1;
+        int hid = -1;
         while (!stop.load(std::memory_order_acquire)) {
+            follow_kernel_card();
             release_ac_if_yielded();
-            if (!hid_ready) {
-                if (!open_own()) {
-                    std::unique_lock<std::mutex> lock(mu);
-                    cv.wait_for(lock, std::chrono::milliseconds(500),
-                                [&] { return stop.load(); });
-                    continue;
+            if (node_is_stale(fd, key_dev) || node_is_stale(hid, hid_dev)) {
+                vol_note("KA13 volume node replaced, reopening");
+                if (fd >= 0) {
+                    ::close(fd);
+                }
+                if (hid >= 0) {
+                    ::close(hid);
+                }
+                fd = -1;
+                hid = -1;
+                hid_bits = 0;
+                key_dev.clear();
+                hid_dev.clear();
+            }
+            if (fd < 0) {
+                fd = open_ka13_keys();
+                if (fd >= 0) {
+                    vol_note("KA13 volume keys follow the kernel input device");
                 }
             }
-            uint8_t buf[64];
-            int transferred = 0;
-            const int rc = libusb_interrupt_transfer(
-                    own,
-                    hid.endpoint,
-                    buf,
-                    hid.packet_bytes,
-                    &transferred,
-                    kInterruptTimeoutMs);
+            if (hid < 0) {
+                hid = open_ka13_hidraw();
+            }
+            if (fd < 0 && hid < 0) {
+                std::unique_lock<std::mutex> lock(mu);
+                cv.wait_for(lock, std::chrono::milliseconds(500),
+                            [&] { return stop.load(); });
+                continue;
+            }
+            struct pollfd pfd[2];
+            nfds_t np = 0;
+            int ev_slot = -1;
+            int hid_slot = -1;
+            if (fd >= 0) {
+                ev_slot = static_cast<int>(np);
+                pfd[np].fd = fd;
+                pfd[np].events = POLLIN;
+                pfd[np].revents = 0;
+                ++np;
+            }
+            if (hid >= 0) {
+                hid_slot = static_cast<int>(np);
+                pfd[np].fd = hid;
+                pfd[np].events = POLLIN;
+                pfd[np].revents = 0;
+                ++np;
+            }
+            const int pr = ::poll(pfd, np, 200);
             if (stop.load(std::memory_order_acquire)) {
                 break;
             }
-            if (rc == LIBUSB_ERROR_TIMEOUT) {
+            if (pr < 0) {
+                if (fd >= 0) ::close(fd);
+                if (hid >= 0) ::close(hid);
+                fd = -1;
+                hid = -1;
                 continue;
             }
-            if (rc == LIBUSB_ERROR_PIPE) {
-                (void)libusb_clear_halt(own, hid.endpoint);
+            if (ev_slot >= 0 &&
+                (pfd[ev_slot].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                ::close(fd);
+                fd = -1;
+            }
+            if (hid_slot >= 0 &&
+                (pfd[hid_slot].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+                ::close(hid);
+                hid = -1;
+                hid_bits = 0;
+            }
+            if (pr == 0) {
                 continue;
             }
-            if (rc == LIBUSB_ERROR_NO_DEVICE || rc == LIBUSB_ERROR_IO ||
-                rc == LIBUSB_ERROR_INTERRUPTED) {
-                vol_note("volume service HID closed (%s)", libusb_error_name(rc));
-                close_own();
-                continue;
+            if (ev_slot >= 0 && (pfd[ev_slot].revents & POLLIN) != 0) {
+                struct input_event ev;
+                while (::read(fd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+                    if (ev.type != EV_KEY || ev.value == 0) {
+                        continue;
+                    }
+                    vol_note("key %u value %d", ev.code, ev.value);
+                    /* The same press is also the hidraw report. Applying
+                     * both moves the level by two steps. */
+                    if (hid >= 0 &&
+                        (ev.code == KEY_VOLUMEUP || ev.code == KEY_VOLUMEDOWN)) {
+                        continue;
+                    }
+                    if (ev.code == KEY_VOLUMEUP) {
+                        apply_direction(+1);
+                    } else if (ev.code == KEY_VOLUMEDOWN) {
+                        apply_direction(-1);
+                    }
+                }
             }
-            if (rc < 0) {
-                usleep(20000);
-                continue;
-            }
-            if (transferred > 0) {
-                on_report(buf, transferred);
+            if (hid_slot >= 0 && (pfd[hid_slot].revents & POLLIN) != 0) {
+                uint8_t buf[64];
+                const ssize_t n = ::read(hid, buf, sizeof(buf));
+                if (n > 0) {
+                    if (buf[0] != hid_bits) {
+                        vol_note("hid raw %d %02x", static_cast<int>(n), buf[0]);
+                    }
+                    on_hid_report(buf, static_cast<int>(n));
+                }
             }
         }
-        close_own();
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        if (hid >= 0) {
+            ::close(hid);
+        }
     }
+
 };
 
 VolumeService *g_service = nullptr;
@@ -1051,6 +1888,9 @@ void uac2_volume_service_start() {
     if (g_service != nullptr) {
         return;
     }
+    g_ka13_level.store(
+            load_published_level(g_ka13_level.load(std::memory_order_relaxed)),
+            std::memory_order_relaxed);
     auto *service = new (std::nothrow) VolumeService();
     if (service == nullptr) {
         return;
@@ -1096,14 +1936,40 @@ void uac2_volume_service_attach(libusb_device_handle *handle, int ac_interface) 
     if (service == nullptr || handle == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> lock(service->mu);
-    service->audio = handle;
-    service->audio_ac = ac_interface;
-    service->external_ac = true;
-    if (service->have_feature) {
-        service->feature.ac_interface = ac_interface;
+    {
+        std::unique_lock<std::mutex> lock(service->mu);
+        service->audio = handle;
+        service->audio_ac = ac_interface;
+        service->external_ac = true;
+        service->session_hid_released = false;
+        if (service->have_feature) {
+            service->feature.ac_interface = ac_interface;
+        }
+        service->cv.notify_all();
+        service->cv.wait_for(lock, std::chrono::milliseconds(1500), [&] {
+            return service->hid_yielded || service->stop.load();
+        });
     }
-    service->cv.notify_all();
+    (void)service->claim_session_interface(handle);
+    if (service->have_feature || ac_interface < 0) return;
+    FeatureVolume parsed;
+    if (!find_feature_volume(handle, ac_interface, &parsed) ||
+        !load_range_and_current(handle, &parsed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(service->mu);
+    if (service->audio != handle) return;
+    service->feature = parsed;
+    service->feature.ac_interface = ac_interface;
+    service->have_feature = true;
+}
+
+void uac2_volume_service_arm_session_hid(libusb_device_handle *handle) {
+    VolumeService *service = g_service;
+    if (service == nullptr || handle == nullptr) {
+        return;
+    }
+    service->arm_session_hid(handle);
 }
 
 void uac2_volume_service_detach() noexcept {
@@ -1111,9 +1977,45 @@ void uac2_volume_service_detach() noexcept {
     if (service == nullptr) {
         return;
     }
-    std::lock_guard<std::mutex> lock(service->mu);
-    service->audio = nullptr;
-    service->audio_ac = -1;
+    libusb_transfer *xfer = nullptr;
+    libusb_device_handle *handle = nullptr;
+    int iface = -1;
+    bool claimed = false;
+    {
+        std::lock_guard<std::mutex> lock(service->mu);
+        service->audio = nullptr;
+        service->audio_ac = -1;
+        service->session_hid_stop.store(true, std::memory_order_release);
+        xfer = service->session_xfer;
+        handle = service->session_handle;
+        iface = service->session_iface;
+        claimed = service->session_claimed;
+        service->cv.notify_all();
+    }
+    if (xfer != nullptr && !service->session_hid_idle.load(std::memory_order_acquire)) {
+        (void)libusb_cancel_transfer(xfer);
+        std::unique_lock<std::mutex> lock(service->mu);
+        service->cv.wait_for(lock, std::chrono::milliseconds(500), [&] {
+            return service->session_hid_idle.load(std::memory_order_acquire) ||
+                   service->stop.load();
+        });
+    }
+    if (claimed && handle != nullptr && iface >= 0) {
+        (void)libusb_release_interface(handle, iface);
+    }
+    {
+        std::lock_guard<std::mutex> lock(service->mu);
+        if (service->session_xfer != nullptr &&
+            service->session_hid_idle.load(std::memory_order_acquire)) {
+            libusb_free_transfer(service->session_xfer);
+            service->session_xfer = nullptr;
+        }
+        service->session_handle = nullptr;
+        service->session_iface = -1;
+        service->session_claimed = false;
+        service->session_hid_released = true;
+        service->cv.notify_all();
+    }
 }
 
 void uac2_volume_service_ac_free() noexcept {
@@ -1126,4 +2028,129 @@ void uac2_volume_service_ac_free() noexcept {
     service->audio_ac = -1;
     service->external_ac = false;
     service->cv.notify_all();
+}
+
+void uac2_volume_service_remember(libusb_device_handle *handle, int ac_interface) {
+    VolumeService *service = g_service;
+    if (service == nullptr || handle == nullptr || ac_interface < 0) {
+        return;
+    }
+    FeatureVolume parsed;
+    if (!find_feature_volume(handle, ac_interface, &parsed) ||
+        !load_range_and_current(handle, &parsed)) {
+        vol_note("volume remember failed");
+        return;
+    }
+    bool mute_on = false;
+    if (parsed.mute_channel >= 0) {
+        uint8_t mute = 0;
+        if (get_u8(handle, ac_interface, parsed.unit_id, kCsMute,
+                   parsed.mute_channel, &mute)) {
+            mute_on = mute != 0;
+        }
+    }
+    std::lock_guard<std::mutex> lock(service->mu);
+    service->feature = parsed;
+    service->feature.ac_interface = ac_interface;
+    service->have_feature = true;
+    service->have_memory = true;
+    service->remembered_mute = mute_on;
+    service->mute_cleared = !mute_on;
+    vol_note("volume remember %d (%+.2f dB) range %d..%d step %d mute %s",
+             static_cast<int>(parsed.current),
+             static_cast<double>(parsed.current) / 256.0,
+             static_cast<int>(parsed.minimum),
+             static_cast<int>(parsed.maximum),
+             static_cast<int>(parsed.step),
+             mute_on ? "on" : "off");
+}
+
+void uac2_volume_service_lock_full(libusb_device_handle *handle) {
+    if (handle == nullptr) {
+        return;
+    }
+    const int ac = audio_control_interface(libusb_get_device(handle));
+    if (ac < 0) {
+        return;
+    }
+    FeatureVolume parsed;
+    if (!find_feature_volume(handle, ac, &parsed) ||
+        !load_range_and_current(handle, &parsed)) {
+        vol_note("volume full-scale unread");
+        return;
+    }
+    if (parsed.mute_channel >= 0) {
+        (void)set_u8(handle, ac, parsed.unit_id, kCsMute, parsed.mute_channel, 0);
+    }
+    int level = load_published_level(g_ka13_level.load(std::memory_order_relaxed));
+    if (level > parsed.maximum) level = parsed.maximum;
+    if (level < parsed.minimum) level = parsed.minimum;
+    g_ka13_level.store(level, std::memory_order_relaxed);
+    publish_level(level);
+    bool wrote = parsed.channel_count > 0;
+    for (int i = 0; i < parsed.channel_count; ++i) {
+        if (!set_s16(handle, ac, parsed.unit_id, kCsVolume,
+                     parsed.channels[i], static_cast<int16_t>(level))) {
+            wrote = false;
+        }
+    }
+    vol_note("volume set to %d (%+.2f dB) %s",
+             level,
+             static_cast<double>(level) / 256.0,
+             wrote ? "ok" : "failed");
+}
+
+void uac2_volume_service_restore(libusb_device_handle *handle) {
+    VolumeService *service = g_service;
+    if (service == nullptr || handle == nullptr) {
+        return;
+    }
+    FeatureVolume feature;
+    bool mute_on = false;
+    {
+        std::lock_guard<std::mutex> lock(service->mu);
+        if (!service->have_memory) {
+            return;
+        }
+        feature = service->feature;
+        mute_on = service->remembered_mute;
+    }
+    if (feature.mute_channel >= 0 && !mute_on) {
+        if (set_u8(handle, feature.ac_interface, feature.unit_id, kCsMute,
+                   feature.mute_channel, 0)) {
+            vol_note("volume unmute");
+        }
+    }
+    bool wrote = feature.channel_count > 0;
+    for (int i = 0; i < feature.channel_count; ++i) {
+        if (!set_s16(handle, feature.ac_interface, feature.unit_id, kCsVolume,
+                     feature.channels[i], feature.current)) {
+            wrote = false;
+        }
+    }
+    vol_note("volume restore %d (%+.2f dB) %s",
+             static_cast<int>(feature.current),
+             static_cast<double>(feature.current) / 256.0,
+             wrote ? "ok" : "failed");
+    if (feature.mute_channel >= 0) {
+        uint8_t mute = 0;
+        if (get_u8(handle, feature.ac_interface, feature.unit_id, kCsMute,
+                   feature.mute_channel, &mute)) {
+            vol_note("volume readback mute %u", mute);
+        } else {
+            vol_note("volume readback mute failed");
+        }
+    }
+    for (int i = 0; i < feature.channel_count; ++i) {
+        int16_t got = 0;
+        if (get_s16(handle, feature.ac_interface, feature.unit_id, kCsVolume,
+                    feature.channels[i], &got)) {
+            vol_note("volume readback ch %u = %d (%+.2f dB)",
+                     feature.channels[i],
+                     static_cast<int>(got),
+                     static_cast<double>(got) / 256.0);
+        } else {
+            vol_note("volume readback ch %u failed", feature.channels[i]);
+        }
+    }
 }

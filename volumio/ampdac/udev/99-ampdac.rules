@@ -8,3 +8,7 @@
 # Match ID_USB_INTERFACES like :010120:010220:… (UAC1/UAC2).
 
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:0102??:*", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+
+# KA13's kernel driver unmutes at 0 dB as soon as the card exists.
+# Set the saved level before userspace opens the PCM.
+SUBSYSTEM=="sound", ACTION=="add", KERNEL=="controlC[0-9]*", RUN+="/usr/local/sbin/ampdac-asound apply-hwlevel %k"
