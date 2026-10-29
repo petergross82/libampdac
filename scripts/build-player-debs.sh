@@ -46,6 +46,9 @@ build_one() {
 build_volumio() {
     local debarch="$1" binarch="$2"
     local stage out
+    # -2 replaces a -1 that apt will not unpack again. The -1 postinst
+    # died while editing the MPD template on the /volumio mount.
+    local debver="${version}-2"
     stage=$(mktemp -d)
     out="$root/dist/ampdac-volumio_${debver}_${debarch}.deb"
     copy_tree "$root/volumio/ampdac" "$stage/usr/share/ampdac/volumio"

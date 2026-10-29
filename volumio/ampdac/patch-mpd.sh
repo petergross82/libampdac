@@ -20,8 +20,17 @@ rmdir /etc/systemd/system/mpd.service.d 2>/dev/null || true
 strip_markers() {
     local conf="$1"
     [ -f "$conf" ] && [ -w "$conf" ] || return 0
-    sed -i '/# ampdac-output begin/,/# ampdac-output end/d' "$conf"
-    sed -i '/# ampdac-disabled$/d' "$conf"
+    # sed -i renames a temporary file onto the original. On Volumio's
+    # /volumio mount that rename returns "Device or resource busy".
+    local work
+    work="$(mktemp)"
+    cp "$conf" "$work"
+    sed '/# ampdac-output begin/,/# ampdac-output end/d' "$work" > "$work.2"
+    sed '/# ampdac-disabled$/d' "$work.2" > "$work.3"
+    if ! cmp -s "$conf" "$work.3"; then
+        cat "$work.3" > "$conf"
+    fi
+    rm -f "$work" "$work.2" "$work.3"
 }
 
 strip_markers "$TEMPLATE"

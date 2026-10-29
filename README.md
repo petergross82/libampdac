@@ -121,8 +121,8 @@ second player on top of it.
 | Package | Where |
 | --- | --- |
 | `ampdac_0.3.21-1_amd64.deb` | Debian amd64. ALSA device `ampdac` |
-| `ampdac-volumio_0.3.21-1_armhf.deb` | Volumio 3, 32-bit Pi |
-| `ampdac-volumio_0.3.21-1_arm64.deb` | Volumio 3, 64-bit Pi |
+| `ampdac-volumio_0.3.21-2_armhf.deb` | Volumio 3, 32-bit Pi |
+| `ampdac-volumio_0.3.21-2_arm64.deb` | Volumio 3, 64-bit Pi |
 | `ampdac-moode_0.3.21-1_arm64.deb` | moOde 10.3.6, 64-bit only |
 
 The Volumio package was installed with `dpkg` on a 32-bit Volumio 3 image.
@@ -169,7 +169,7 @@ Use the armhf package on a 32-bit image and the arm64 package on a 64-bit
 image. Installing restarts Volumio once, so the plugin process loads.
 
 ~~~
-sudo dpkg -i ampdac-volumio_0.3.21-1_armhf.deb
+sudo apt install ./ampdac-volumio_0.3.21-2_armhf.deb
 ~~~
 
 Enable **ampdac** under Plugins → Installed plugins if it is off. Playback
