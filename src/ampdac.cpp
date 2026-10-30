@@ -397,6 +397,10 @@ struct VolumeAcLease {
     }
 };
 
+/* Survives close. The next open uses it to tell a PCM↔DSD alt change
+ * from a reopen in the same mode. */
+bool g_last_stream_was_dsd = false;
+
 ampdac_status program_usb_stream(
         ampdac_session *session,
         uint32_t usb_clock_hz,
@@ -437,6 +441,9 @@ ampdac_status program_usb_stream(
      * streaming alt is up and before any isochronous transfer is queued.
      * A control transfer after that wedges dwc_otg's periodic schedule. */
 
+    int clock_iface = 0;
+    int clock_id = 1;
+
     const auto idle_then_clock = [&](bool extra_settle) -> int {
         (void)uac2_apply_alt_setting(
                 ctx->device_handle,
@@ -450,8 +457,10 @@ ampdac_status program_usb_stream(
         int detected_ac_iface = -1;
         const int detected_clock_id =
                 uac2_find_clock_source_id(ctx->device_handle, &detected_ac_iface);
-        const int ctrl_iface = detected_ac_iface >= 0 ? detected_ac_iface : 0;
-        const int csid = detected_clock_id > 0 ? detected_clock_id : 1;
+        clock_iface = detected_ac_iface >= 0 ? detected_ac_iface : 0;
+        clock_id = detected_clock_id > 0 ? detected_clock_id : 1;
+        const int ctrl_iface = clock_iface;
+        const int csid = clock_id;
 
         const int ctrl_claim = libusb_claim_interface(ctx->device_handle, ctrl_iface);
         if (ctrl_claim == LIBUSB_SUCCESS) {
@@ -472,7 +481,11 @@ ampdac_status program_usb_stream(
         return clock_rc;
     };
 
-    int clock_rc = idle_then_clock(false);
+    /* PCM alt 1/2 and the RAW/DSD alt 3 share one interface. The PLL step
+     * between them is the one SMSL stalls on if SET_CUR is followed by
+     * another alt 0. Wait out that step before touching the clock. */
+    const bool mode_switch = g_last_stream_was_dsd != session->dsd;
+    int clock_rc = idle_then_clock(mode_switch);
     if (clock_rc != 4) {
         // EP0 often stays stalled after a DSD session whose soft-reset timed
         // out and then poked a second clock ID. A port reset clears it; the
@@ -500,16 +513,47 @@ ampdac_status program_usb_stream(
         return AMPDAC_ERR_CLOCK;
     }
 
-    const UsbControlStatus alt = uac2_apply_alt_setting(
+    /* idle_then_clock already parked alt 0 and programmed the rate.
+     * Do not idle again: that second SET_INTERFACE 0 is what makes the
+     * following PCM↔DSD jump stall, after which the DAC re-enumerates. */
+    UsbControlStatus alt = uac2_apply_alt_setting(
             ctx->device_handle,
             session->endpoint.interface_number,
             session->endpoint.alt_setting,
-            session->endpoint.endpoint_address);
+            session->endpoint.endpoint_address,
+            false);
+    if (alt != UsbControlStatus::Success) {
+        (void)uac2_apply_alt_setting(
+                ctx->device_handle,
+                ctx->claimed_interface_number,
+                0,
+                0);
+        usleep(100000U);
+        int winning_clock_id = 0;
+        const int again = uac2_force_clock_sample_rate(
+                ctx->device_handle,
+                static_cast<uint8_t>(clock_iface),
+                clock_id,
+                usb_clock_hz,
+                &winning_clock_id);
+        if (again == 4) {
+            ctx->resolved_clock_source_id = static_cast<uint8_t>(winning_clock_id);
+            ctx->ctrl_interface_number = clock_iface;
+        }
+        alt = uac2_apply_alt_setting(
+                ctx->device_handle,
+                session->endpoint.interface_number,
+                session->endpoint.alt_setting,
+                session->endpoint.endpoint_address,
+                false);
+    }
     if (alt != UsbControlStatus::Success) {
         set_error("SET_INTERFACE alt-setting failed");
         return AMPDAC_ERR_IO;
     }
     ctx->active_alt_setting = session->endpoint.alt_setting;
+    ctx->was_dsd_session = session->dsd;
+    g_last_stream_was_dsd = session->dsd;
 
     /* XMOS/FiiO drops a clock programmed at alt 0 when the streaming alt
      * comes up. The PLL then stays at the power-on rate while we send
@@ -928,6 +972,7 @@ extern "C" ampdac_status ampdac_configure_pcm(
         return AMPDAC_ERR_FORMAT;
     }
     (void)ctx->playback_state.transition_to(UsbPlaybackState::Configured);
+    session->dsd = false;
 
     const ampdac_status usb_st = program_usb_stream(
             session,
@@ -1049,6 +1094,8 @@ extern "C" ampdac_status ampdac_configure_dsd(
             ctx->pcm_valid_bit_depth,
     };
     (void)ctx->playback_state.transition_to(UsbPlaybackState::Configured);
+    session->dsd = true;
+    session->native_dsd = native;
 
     const ampdac_status usb_st = program_usb_stream(
             session,

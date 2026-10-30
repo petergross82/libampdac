@@ -406,7 +406,8 @@ UsbControlStatus uac2_apply_alt_setting(
         libusb_device_handle *handle,
         int                   iface_num,
         int                   alt_num,
-        int                   endpoint_address)
+        int                   endpoint_address,
+        bool                  idle_first)
 {
     if (handle == nullptr) {
         CLOGE("uac2_apply_alt_setting: null handle — aborting");
@@ -429,7 +430,7 @@ UsbControlStatus uac2_apply_alt_setting(
     // hard error: if the interface is already at alt 0 or the firmware treats
     // two consecutive SET_INTERFACE calls as idempotent, any non-SUCCESS return
     // is a harmless diagnostic artefact, not a protocol violation.
-    if (alt_num != 0) {
+    if (idle_first && alt_num != 0) {
         CLOGI("uac2_apply_alt_setting: hard-reset — "
               "SET_INTERFACE iface=%d alt=0 (idle) before activating alt=%d",
               iface_num, alt_num);

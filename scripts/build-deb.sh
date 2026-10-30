@@ -2,7 +2,7 @@
 # Build dist/ampdac_<version>_amd64.deb from the desktop Makefile artifacts.
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-version=0.3.21
+version=0.3.22
 debver=${version}-1
 arch=amd64
 stage=$(mktemp -d)

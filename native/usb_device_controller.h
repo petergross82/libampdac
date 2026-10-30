@@ -317,6 +317,11 @@ UsbInterfaceClaimResult uac2_claim_interface_only(
  * @param alt_num           Desired alternate setting (0 = idle; ≥ 1 = ISO active).
  * @param endpoint_address  `bEndpointAddress` of the isochronous OUT endpoint
  *                          (e.g., `0x01`).  Pass `0` to skip `libusb_clear_halt`.
+ * @param idle_first        When true and `alt_num != 0`, park the interface
+ *                          on alt 0 before the target alt. Pass false when the
+ *                          caller already did that and then programmed the
+ *                          clock: a second alt 0 aborts the PLL move, and
+ *                          SMSL/Thesycon then stalls the PCM↔DSD alt jump.
  * @return                  `UsbControlStatus::Success` on success; one of the
  *                          `AltSetting*` codes on failure.
  */
@@ -324,7 +329,8 @@ UsbControlStatus uac2_apply_alt_setting(
         libusb_device_handle *handle,
         int                   iface_num,
         int                   alt_num,
-        int                   endpoint_address = 0);
+        int                   endpoint_address = 0,
+        bool                  idle_first = true);
 
 /**
  * Release a previously claimed interface and restore the zero-bandwidth alt setting.
